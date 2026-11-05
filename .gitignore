@@ -1,5 +1,6 @@
 env/
 samples/
+samples_one_view/
 test/out
 test/real
 test/synth
