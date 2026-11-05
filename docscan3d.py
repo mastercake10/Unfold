@@ -370,18 +370,20 @@ def page_outline(gray, mask, step=4.0, half=18):
 
 def assign_edges(pts, quad, corner_excl=0.06):
     """Edge index per outline point (0 top, 1 right, 2 bottom, 3 left in the image
-    quad order tl,tr,br,bl); -1 near corners."""
-    eid = np.full(len(pts), -1)
-    best = np.full(len(pts), np.inf)
-    for i in range(4):
-        a, b = quad[i], quad[(i + 1) % 4]
-        d = b - a
-        L = np.linalg.norm(d)
-        tpar = ((pts - a) @ d) / (L * L)
-        dist = np.abs(cross2(d / L, pts - a))
-        inner = (tpar > corner_excl) & (tpar < 1 - corner_excl)
-        better = inner & (dist < best) & (dist < 0.05 * L)
-        eid[better], best[better] = i, dist[better]
+    quad order tl,tr,br,bl); -1 near corners. Uses the order along the contour
+    between the corners, so kinked edges of folded pages are kept."""
+    n = len(pts)
+    ci = [int(np.argmin(np.linalg.norm(pts - q, axis=1))) for q in quad]
+    fwd = lambda a, b: (b - a) % n
+    # contour direction: forward from corner 0, corner 1 must come before corners 2, 3
+    forward = fwd(ci[0], ci[1]) < fwd(ci[0], ci[2]) and fwd(ci[0], ci[1]) < fwd(ci[0], ci[3])
+    eid = np.full(n, -1)
+    for k in range(4):
+        a, b = ci[k], ci[(k + 1) % 4]
+        L = fwd(a, b) if forward else fwd(b, a)
+        for m in range(L + 1):
+            if corner_excl * L < m < (1 - corner_excl) * L:
+                eid[(a + m) % n if forward else (a - m) % n] = k
     return eid
 
 
@@ -492,7 +494,42 @@ def from_page(F, U):
 
 # ---------------------------------------------------------------- height field
 
-def fit_heightfield(uvz, bounds, step, lam, n_irls=6, w=None):
+def grid_bounds(uv, W, H, margin=15.0):
+    """Height-field extent: the nominal page plus whatever the data covers. With
+    steep folds the page does not sit at 0..W x 0..H in the plane frame."""
+    lo = np.percentile(uv, 0.5, axis=0)
+    hi = np.percentile(uv, 99.5, axis=0)
+    u0 = min(-margin, lo[0] - margin); u1 = max(W + margin, hi[0] + margin)
+    v0 = min(-margin, lo[1] - margin); v1 = max(H + margin, hi[1] + margin)
+    # guard against outliers blowing up the grid (relative to where the data is)
+    mu, mv = np.median(uv, axis=0)
+    return (max(u0, mu - 1.2 * W), min(u1, mu + 1.2 * W), max(v0, mv - 1.2 * H), min(v1, mv + 1.2 * H))
+
+
+def fold_direction(gu, gv, Z):
+    """Dominant bending direction from the height field's curvature. Returns the
+    in-plane angle of the fold lines (rulings) and an anisotropy in [0, 1]."""
+    step = gu[1] - gu[0]
+    zv, zu = np.gradient(Z, step)
+    zuv, zuu = np.gradient(zu, step)
+    zvv, _ = np.gradient(zv, step)
+    T = np.zeros((2, 2))
+    for a, b, c in zip(zuu.ravel(), zuv.ravel(), zvv.ravel()):
+        Hm = np.array([[a, b], [b, c]])
+        ev, evec = np.linalg.eigh(Hm)
+        k = int(np.argmax(np.abs(ev)))
+        wgt = abs(ev[k]) - abs(ev[1 - k])
+        T += wgt * np.outer(evec[:, k], evec[:, k])
+    ev, evec = np.linalg.eigh(T)
+    across = evec[:, 1]
+    aniso = (ev[1] - ev[0]) / (ev[1] + ev[0] + 1e-12)
+    ruling = np.array([-across[1], across[0]])
+    ang = float(np.arctan2(ruling[1], ruling[0]))
+    ang = (ang + np.pi / 2) % np.pi - np.pi / 2  # a fold line has no sign
+    return ang, float(aniso)
+
+
+def fit_heightfield(uvz, bounds, step, lam, n_irls=6, w=None, ruling_w=1.0):
     """Robust smooth z(u,v) on a grid: bilinear data term + second-difference
     regularizer, both IRLS-Huber so creases stay sharp-ish and outliers drop out."""
     u0, u1, v0, v1 = bounds
@@ -518,14 +555,17 @@ def fit_heightfield(uvz, bounds, step, lam, n_irls=6, w=None):
     tri = []
     tri.append(np.stack([idx[:, :-2].ravel(), idx[:, 1:-1].ravel(), idx[:, 2:].ravel()], 1))
     tri.append(np.stack([idx[:-2, :].ravel(), idx[1:-1, :].ravel(), idx[2:, :].ravel()], 1))
+    n_u = len(tri[0])
     tri = np.concatenate(tri)
     k = len(tri)
+    # extra stiffness along u when u is the fold (ruling) direction: paper stays straight there
+    dir_w = np.r_[np.full(n_u, ruling_w), np.ones(k - n_u)]
     D = sparse.csr_matrix((np.tile([1.0, -2.0, 1.0], k), (np.repeat(np.arange(k), 3), tri.ravel())), shape=(k, N))
 
     area = (u1 - u0) * (v1 - v0)
     dens = w.sum() / area * step * step
     wd = w.copy()
-    wr = np.ones(k) * lam * dens
+    wr = dir_w * lam * dens
     for _ in range(n_irls):
         M = A.T @ sparse.diags(wd) @ A + D.T @ sparse.diags(wr) @ D + 1e-9 * sparse.eye(N)
         zz = spsolve(M.tocsc(), A.T @ (wd * z))
@@ -534,7 +574,8 @@ def fit_heightfield(uvz, bounds, step, lam, n_irls=6, w=None):
         wd = w * np.minimum(1.0, 2 * sd / (np.abs(rd) + 1e-12))
         rr = D @ zz
         sr = 1.4826 * np.median(np.abs(rr)) + 1e-6
-        wr = lam * dens * np.minimum(1.0, 3 * sr / (np.abs(rr) + 1e-12))
+        # heavy-tailed (Cauchy) so genuine creases are not smoothed away
+        wr = dir_w * lam * dens / (1 + (rr / (3 * sr)) ** 2)
     return gu, gv, zz.reshape(nv, nu), A @ zz - z
 
 
@@ -556,7 +597,7 @@ def ray_surface(rays, F, gu, gv, Z, c, n, iters=50):
         uvz = to_page(F, rays * lam[:, None])
         return uvz[:, 2] - sample_heightfield(gu, gv, Z, uvz[:, 0], uvz[:, 1])
 
-    lo, hi = 0.8 * lam0, 1.2 * lam0
+    lo, hi = 0.6 * lam0, 1.4 * lam0
     flo, fhi = f(lo), f(hi)
     ok = flo * fhi <= 0
     for _ in range(iters):
@@ -597,8 +638,7 @@ def fit_rectangle(st, side, W, H, x0):
     return res.x, xf, r
 
 
-def corners_init(st_c, W, H):
-    dst = np.array([[0, 0], [W, 0], [W, H], [0, H]], float)
+def corners_init(st_c, dst):
     a, b = st_c - st_c.mean(0), dst - dst.mean(0)
     U_, _, Vt = np.linalg.svd(b.T @ a)
     D = np.diag([1, np.sign(np.linalg.det(U_ @ Vt))])
@@ -630,11 +670,10 @@ def flatten_grid(gu, gv, Z):
         return np.concatenate([d - L, anchor * (x - x0)])
 
     m = len(E)
-    S = sparse.lil_matrix((m + len(x0), len(x0)), dtype=int)
-    for k, (i, j) in enumerate(E):
-        S[k, 2 * i:2 * i + 2] = 1
-        S[k, 2 * j:2 * j + 2] = 1
-    S[m:, :] = sparse.eye(len(x0), dtype=int)
+    n2 = len(x0)
+    rows = np.r_[np.repeat(np.arange(m), 4), m + np.arange(n2)]
+    cols = np.r_[np.stack([2 * E[:, 0], 2 * E[:, 0] + 1, 2 * E[:, 1], 2 * E[:, 1] + 1], 1).ravel(), np.arange(n2)]
+    S = sparse.csr_matrix((np.ones(len(rows), int), (rows, cols)), shape=(m + n2, n2))
     res = least_squares(resid, x0, jac_sparsity=S, method="trf", x_scale=1.0, max_nfev=200)
     st = res.x.reshape(nv_, nu_, 2)
     strain = np.abs(resid(res.x)[:m]) / L
@@ -840,6 +879,65 @@ def to_uint8(alb, white=0.95):
     return np.clip((gray + chroma * keep) * 255 * white, 0, 255).astype(np.uint8)
 
 
+def tilt_sims(g, mask, tilts, sift):
+    """ASIFT-style affine simulations: keypoints of tilted/rotated copies of the
+    image, mapped back to original coordinates."""
+    out = []
+    h, w = g.shape
+    for t in tilts:
+        for phi in ([0.0] if t == 1 else np.arange(0, 180, 72 / t)):
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), phi, 1.0)
+            c = np.abs(M[:, :2])
+            nw, nh = int(h * c[0, 1] + w * c[0, 0]), int(h * c[1, 1] + w * c[1, 0])
+            M[0, 2] += nw / 2 - w / 2
+            M[1, 2] += nh / 2 - h / 2
+            T = np.diag([1 / t, 1.0])
+            A = np.c_[T @ M[:, :2], T @ M[:, 2]]
+            src = cv2.GaussianBlur(g, (0, 0), 0.8 * np.sqrt(t * t - 1)) if t > 1 else g
+            gi = cv2.warpAffine(src, A, (int(np.ceil(nw / t)), nh), flags=cv2.INTER_LINEAR)
+            mi = cv2.warpAffine(mask, A, (int(np.ceil(nw / t)), nh), flags=cv2.INTER_NEAREST) if mask is not None else None
+            kp, ds = sift.detectAndCompute(gi, mi)
+            if ds is None or len(kp) < 2:
+                continue
+            P = np.float64([k.pt for k in kp])
+            out.append((np.c_[P, np.ones(len(P))] @ cv2.invertAffineTransform(A).T, ds))
+    return out
+
+
+def asift_match(sims0, simsj, ratio=0.8):
+    flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=64))
+    P0, Pj = [], []
+    for p0, d0 in sims0:
+        for pj, dj in simsj:
+            m = flann.knnMatch(d0, dj, k=2)
+            m2 = flann.knnMatch(dj, d0, k=2)
+            back = {x[0].queryIdx: x[0].trainIdx for x in m2 if len(x) == 2 and x[0].distance < ratio * x[1].distance}
+            for x in m:
+                if len(x) == 2 and x[0].distance < ratio * x[1].distance and back.get(x[0].trainIdx) == x[0].queryIdx:
+                    P0.append(p0[x[0].queryIdx]); Pj.append(pj[x[0].trainIdx])
+    if not P0:
+        return np.empty((0, 2)), np.empty((0, 2))
+    P0, Pj = np.array(P0), np.array(Pj)
+    _, u = np.unique(np.round(np.c_[P0, Pj] / 2), axis=0, return_index=True)
+    return P0[u], Pj[u]
+
+
+def page_coverage(pts, mask, n=8):
+    """Share of page cells (n x n over the page bbox) containing >= 3 points."""
+    ys, xs = np.nonzero(mask)
+    x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+    cells = 0
+    hit = 0
+    hist = np.histogram2d(pts[:, 1], pts[:, 0], [n, n], [[y0, y1], [x0, x1]])[0] if len(pts) else np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            sub = mask[y0 + (y1 - y0) * i // n:y0 + (y1 - y0) * (i + 1) // n, x0 + (x1 - x0) * j // n:x0 + (x1 - x0) * (j + 1) // n]
+            if sub.size and (sub > 0).mean() > 0.5:
+                cells += 1
+                hit += hist[i, j] >= 3
+    return hit / max(cells, 1)
+
+
 def match_ref(kp0, d0, g, mask, n_features):
     sift = cv2.SIFT_create(nfeatures=n_features, contrastThreshold=0.02)
     kp, d = sift.detectAndCompute(g, mask)
@@ -917,6 +1015,10 @@ def main():
                     help="blend all views (against glare/shadows in single shots; may soften geometry slightly)")
     ap.add_argument("--no-shading", action="store_true", help="keep the original illumination")
     ap.add_argument("--dense", type=int, default=40000, help="max candidate points for densification")
+    ap.add_argument("--ruling", type=float, default=20.0,
+                    help="stiffness along the fold direction when the page is folded one way (1 = off)")
+    ap.add_argument("--asift", choices=("auto", "on", "off"), default="auto",
+                    help="tilt-simulated matching for steep folds (auto: when plain matches leave the page uncovered)")
     args = ap.parse_args()
     if len(args.images) < 2:
         sys.exit("need at least two images")
@@ -971,31 +1073,64 @@ def main():
     obs[:, 0] = P0
     Rs, ts = [np.eye(3)], [np.zeros(3)]
     Ks = cam_K(cam)
+    extra = []  # rows from tilt-simulated matching (not tied to reference keypoints)
+    sims0 = None
     for j in range(1, V):
         mj = cv2.dilate(masks[j], np.ones((41, 41), np.uint8)) if masks[j] is not None else None
         i0, pj, nk = match_ref(kp0, d0, gs[j], mj, args.features)
         E, inl = cv2.findEssentialMat(P0[i0], pj, Ks, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=1.0)
         inl = inl.ravel().astype(bool)
         i0, pj = i0[inl], pj[inl]
-        _, R, t, _ = cv2.recoverPose(E, P0[i0], pj, Ks)
-        A, _ = local_affines(P0[i0], pj)
-        pr, ok = refine_subpixel(gs[0], gs[j], P0[i0], pj, A)
-        ok &= np.linalg.norm(pr - pj, axis=1) < 1.5
-        obs[i0[ok], j] = pr[ok]
+        q0, qj = P0[i0], pj
+        cov = page_coverage(q0, mask_er)
+        used_asift = False
+        if args.asift == "on" or (args.asift == "auto" and cov < 0.4):
+            # steep panels look too different between views for plain SIFT
+            sa = min(1.0, 2000.0 / max(gs[0].shape))
+            small = lambda im: cv2.resize(im, None, fx=sa, fy=sa, interpolation=cv2.INTER_AREA) if sa < 1 else im
+            sift_s = cv2.SIFT_create(nfeatures=8000, contrastThreshold=0.02)
+            if sims0 is None:
+                sims0 = tilt_sims(small(gs[0]), small(mask_er), (1, 2 ** 0.5, 2), sift_s)
+            simsj = tilt_sims(small(gs[j]), small(mj) if mj is not None else None, (1, 2 ** 0.5, 2, 2 * 2 ** 0.5), sift_s)
+            a0, aj = asift_match(sims0, simsj)
+            a0, aj = (a0 + 0.5) / sa - 0.5, (aj + 0.5) / sa - 0.5
+            q0, qj = np.r_[q0, a0], np.r_[qj, aj]
+            E, inl = cv2.findEssentialMat(q0, qj, Ks, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=1.5)
+            inl = inl.ravel().astype(bool)
+            q0, qj = q0[inl], qj[inl]
+            used_asift = True
+        _, R, t, _ = cv2.recoverPose(E, q0, qj, Ks)
+        A, _ = local_affines(q0, qj)
+        pr, ok = refine_subpixel(gs[0], gs[j], q0, qj, A)
+        ok &= np.linalg.norm(pr - qj, axis=1) < (3.0 if used_asift else 1.5)
+        n_plain = len(i0)
+        okp = ok[:n_plain]
+        obs[i0[okp], j] = pr[:n_plain][okp]
+        if used_asift:
+            oka = ok[n_plain:]
+            e = np.full((oka.sum(), V, 2), np.nan)
+            e[:, 0] = q0[n_plain:][oka]
+            e[:, j] = pr[n_plain:][oka]
+            extra.append(e)
         Rs.append(R); ts.append(t.ravel())
-        log(f"  view {j}: {nk} keypoints, {len(i0)} inliers, {ok.sum()} refined")
+        log(f"  view {j}: {nk} keypoints, {len(q0)} inliers, {ok.sum()} refined, page coverage {cov:.2f}"
+            + (f" -> {page_coverage(q0[ok], mask_er):.2f} with tilt simulation" if used_asift else ""))
 
-    # put all views on the scale of view 1 (depth ratios along shared reference rays)
     keep = np.isfinite(obs[:, 1:, 0]).any(1)
-    obs = obs[keep]
+    obs = np.concatenate([obs[keep]] + extra)
+    # put all views on the scale of view 1: depth ratios at nearby reference pixels
+    from scipy.spatial import cKDTree
     base = np.isfinite(obs[:, 1, 0])
     X1 = triangulate_multi(obs[base][:, [0, 1]], Rs[:2], ts[:2], cam)
+    tree1 = cKDTree(obs[base][:, 0])
     for j in range(2, V):
-        both = base & np.isfinite(obs[:, j, 0])
-        if both.sum() < 20:
-            sys.exit(f"view {j} shares too few points with view 1")
-        Xj = triangulate_multi(obs[both][:, [0, j]], [Rs[0], Rs[j]], [ts[0], ts[j]], cam)
-        ts[j] = ts[j] * np.median(X1[both[base]][:, 2] / Xj[:, 2])
+        mj_ = np.isfinite(obs[:, j, 0])
+        Xj = triangulate_multi(obs[mj_][:, [0, j]], [Rs[0], Rs[j]], [ts[0], ts[j]], cam)
+        dd, nn = tree1.query(obs[mj_][:, 0])
+        close = dd < 15
+        if close.sum() < 20:
+            sys.exit(f"view {j} overlaps too little with view 1")
+        ts[j] = ts[j] * np.median(X1[nn[close]][:, 2] / Xj[close][:, 2])
 
     X = triangulate_multi(obs, Rs, ts, cam)
     X, obs, _ = clean_obs(X, obs, Rs, ts, cam, 3.0)
@@ -1015,7 +1150,7 @@ def main():
     c, n = fit_plane(X)
     F = page_frame(cam, quad, c, n, W, H)
     uvz = to_page(F, X)
-    bnd = (-15.0, W + 15.0, -15.0, H + 15.0)
+    bnd = grid_bounds(uvz[:, :2], W, H)
 
     if not args.no_densify:
         log("densifying ...")
@@ -1089,20 +1224,44 @@ def main():
         log(f"  outline points triangulated: top {counts[0]}, right {counts[1]}, "
             f"bottom {counts[2]}, left {counts[3]} (of {len(out0)})")
 
+    if len(Xb):
+        bnd = grid_bounds(np.r_[uvz[:, :2], to_page(F, Xb)[:, :2]], W, H)
+
+    # Letter folds are parallel creases: if the surface clearly bends in one
+    # direction only, turn the frame so u runs along the folds and keep the
+    # paper straight along them (developable prior). Otherwise stay isotropic.
+    ruling_w = 1.0
+    if args.ruling > 1:
+        data = np.r_[uvz, to_page(F, Xb)] if len(Xb) else uvz
+        gu0, gv0, Z0, _ = fit_heightfield(data, bnd, 2 * args.grid, args.smooth)
+        ang, aniso = fold_direction(gu0, gv0, Z0)
+        log(f"  fold direction {np.degrees(ang):.1f} deg, anisotropy {aniso:.2f}")
+        if aniso > 0.6:
+            ca, sa_ = np.cos(ang), np.sin(ang)
+            eu = ca * F["eu"] + sa_ * F["ev"]
+            ev = -sa_ * F["eu"] + ca * F["ev"]
+            F["eu"], F["ev"] = eu, ev
+            uvz = to_page(F, X)
+            bnd = grid_bounds(np.r_[uvz[:, :2], to_page(F, Xb)[:, :2]] if len(Xb) else uvz[:, :2], W, H)
+            ruling_w = args.ruling
+    # physical page corners: image quad corner k joins image edges k-1 and k
+    pos = {frozenset(("top", "left")): (0, 0), frozenset(("top", "right")): (W, 0),
+           frozenset(("bottom", "right")): (W, H), frozenset(("bottom", "left")): (0, H)}
+    cidx = [int(np.argmin(np.linalg.norm(out0 - quad[k], axis=1))) for k in range(4)]
+    ctarget = np.array([pos[frozenset((F["edge_map"][(k - 1) % 4], F["edge_map"][k]))] for k in range(4)], float)
     # Height field, isometric unrolling, then scale/placement from the whole
     # flattened outline (all reference outline points, intersected with the surface).
     rect = None
     for it in range(2):
-        log(f"height field + flattening (pass {it + 1}) ...")
+        log(f"height field + flattening (pass {it + 1}), grid u {bnd[0]:.0f}..{bnd[1]:.0f} v {bnd[2]:.0f}..{bnd[3]:.0f} mm ...")
         data = np.r_[uvz, to_page(F, Xb)] if len(Xb) else uvz
-        gu, gv, Z, resid = fit_heightfield(data, bnd, args.grid, args.smooth)
+        gu, gv, Z, resid = fit_heightfield(data, bnd, args.grid, args.smooth, ruling_w=ruling_w)
         st, strain_med, strain_max = flatten_grid(gu, gv, Z)
         Xo, hit = ray_surface(rays_of(out0, cam), F, gu, gv, Z, c, n)
         uvo = to_page(F, Xo)
         sto = sample_grid2(st, gu, gv, uvo[:, 0], uvo[:, 1])
         use = hit & (side >= 0)
-        cidx = [int(np.argmin(np.linalg.norm(uvo[:, :2] - q_, axis=1))) for q_ in ([0, 0], [W, 0], [W, H], [0, H])]
-        x0 = corners_init(sto[cidx], W, H) if rect is None else rect
+        x0 = corners_init(sto[cidx], ctarget) if rect is None else rect
         rect, xf, rres = fit_rectangle(sto[use], side[use], W, H, x0)
         k = rect[0]
         log(f"  outline fit: scale {k:.4f}, rms {np.sqrt(np.mean(rres ** 2)):.3f} mm "

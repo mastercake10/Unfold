@@ -65,7 +65,19 @@ sample 1 10.6 % → 3.0 %, 2 8.2 % → 5.5 % (rest is show-through from the prin
 |---|---|---|---|---|
 | 4-corner homography (what apps do) | 1.00 mm | 3.04 mm | 2.03 mm | 0.74 |
 | 2 views, known focal | 0.34 mm | 0.96 mm | 1.10 mm (one panel lost) | 0.72 |
-| 4 views, self-calibrated (default) | 0.30 mm | 0.73 mm | 0.67 mm | 0.78 |
+| 4 views, self-calibrated (default) | 0.27 mm | 0.63 mm | 0.47 mm | 0.79 |
+
+Extreme fold (2 views, ~45° creases, downscaled chat photos): 0.34 mm median, p95 0.59 mm.
+
+### Steep folds
+
+- Tilt-simulated (ASIFT-style) matching kicks in automatically when plain SIFT matches
+  leave the page uncovered (`--asift auto|on|off`); steep panels look too different between
+  views otherwise.
+- Fold prior: if the surface bends in one direction only (parallel letter folds), the frame
+  is turned along the folds and the paper is kept straight along them (`--ruling`, 1 = off).
+  This also helps normal letters; curls and diagonal folds keep the isotropic model.
+- The height-field extent follows the data (steeply folded pages do not sit at 0..W x 0..H).
 
 ## Synthetic test
 
