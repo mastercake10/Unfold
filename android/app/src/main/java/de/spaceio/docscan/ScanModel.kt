@@ -19,12 +19,11 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 
-/** The guided shots, in pipeline order: the first one is rendered. */
+/** The guided shots, in pipeline order: the first one is rendered, the second is optional. */
 val STEPS = listOf(
-    "Start" to "Hold the phone above the page, page large and centred. This photo becomes the scan.",
-    "Right" to "From there, move the phone 10–20 cm to the right at the same height. Keep the whole page in view.",
-    "Up" to "Move the phone 10–20 cm towards the top of the page (from the first position).",
-    "Down" to "Move the phone 10–20 cm towards the bottom of the page (from the first position).",
+    "Page" to "Hold the phone above the page, page large and centred, and take the photo.",
+    "Extra" to "Optional, for folded pages: move the phone 10–20 cm to the right at the same height and " +
+        "take a second photo. Or press Process.",
 )
 
 sealed interface Phase {
@@ -112,14 +111,14 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun process() {
-        if (shots.size < 2 || phase == Phase.Processing) return
+        if (shots.isEmpty() || phase == Phase.Processing) return
         phase = Phase.Processing
         progress = ""
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val out = File(outDir, "docscan_$stamp.png")
         val t0 = SystemClock.elapsedRealtime()  // what the user waits for, including photos still in analysis
         worker.execute {
-            val err = if (accepted.size < 2) "Need at least two usable photos." else Native.finish(out.path)
+            val err = if (accepted.isEmpty()) "No usable photo." else Native.finish(out.path)
             val sec = (SystemClock.elapsedRealtime() - t0) / 1000.0
             val log = Native.log()
             // 0 = none ... 3 = severe: the CPU is slowed down to cool the phone

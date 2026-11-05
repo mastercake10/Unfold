@@ -157,7 +157,7 @@ fun CaptureScreen(model: ScanModel) {
                         }
                     }
             )
-            Button(onClick = { model.process() }, enabled = n >= 2 && !busy) { Text("Process") }
+            Button(onClick = { model.process() }, enabled = n >= 1 && !busy) { Text("Process") }
         }
     }
 }

@@ -113,16 +113,21 @@ struct Session::Impl {
         if (!find_page_quad(small, q, v.mask)) fail("could not find the page in the first photo");
         quad = refine_quad(v.gray, q);
         cv::erode(v.mask, mask_er, cv::Mat::ones(15, 15, CV_8U));
-        double t_page = secs(t);
-        sift_detect(v.gray, mask_er, opt.features, P0, d0, opt.gpu);
+        ref_full = img;
+        views.push_back(std::move(v));
+        log(fmt("  photo 1: page %.2f s", secs(t)));
+    }
+
+    // features of the reference, needed once a second photo comes (one photo needs none)
+    void ref_features() {
+        if (!d0.empty() || !P0.empty()) return;
+        auto t = Clock::now();
+        sift_detect(views[0].gray, mask_er, opt.features, P0, d0, opt.gpu);
         double t_sift = secs(t);
         cv::setRNGSeed(0);  // FLANN tree construction is random
         index0 = flann_index(d0);
-        v.n_kp = P0.size();
-        ref_full = img;
-        views.push_back(std::move(v));
-        log(fmt("  photo 1: %zu keypoints", P0.size()));
-        log(fmt("    page %.2f s, features %.2f s, index %.2f s", t_page, t_sift, secs(t)));
+        views[0].n_kp = P0.size();
+        log(fmt("  photo 1: %zu keypoints, features %.2f s, index %.2f s", P0.size(), t_sift, secs(t)));
     }
 
     // features of view j and its matches with the reference; r.error set if unusable
@@ -233,6 +238,7 @@ std::string Session::add(const cv::Mat& img) {
             return "";
         }
         if (p->views.size() >= 8) return "at most 8 photos";
+        p->ref_features();
         ViewData v = p->analyse(img, (int)p->views.size());
         if (!v.m.error.empty()) {
             log("  " + v.m.error);
@@ -286,6 +292,7 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
     log("matching ...");
     std::string err = S.add(images[0]);
     if (!err.empty()) fail(err);
+    if (images.size() > 1) S.p->ref_features();
     // the other views in parallel, kept in input order
     const int V = (int)images.size();
     std::vector<ViewData> vd(V);

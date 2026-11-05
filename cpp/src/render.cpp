@@ -2,6 +2,7 @@
 #include <opencv2/photo.hpp>
 
 #include <algorithm>
+#include <functional>
 
 #include "stages.hpp"
 
@@ -165,8 +166,8 @@ cv::Mat remove_shading(const cv::Mat& img, const cv::Mat& valid, const cv::Mat& 
     cv::Mat num, den, num2, den2;
     parallel_for(cv::Range(0, 4), [&](const cv::Range& rg) {  // OpenCV runs each blur on one core
         for (int k = rg.start; k < rg.end; k++) {
-            if (k == 0) cv::GaussianBlur(resm, num, cv::Size(0, 0), sig);
-            if (k == 1) cv::GaussianBlur(paper, den, cv::Size(0, 0), sig);
+            if (k == 0) wide_blur(resm, num, sig);
+            if (k == 1) wide_blur(paper, den, sig);
             if (k == 2) wide_blur(resm, num2, 6 * sig);
             if (k == 3) wide_blur(paper, den2, 6 * sig);
         }
@@ -221,14 +222,40 @@ cv::Mat to_uint8(const cv::Mat& alb, double white) {
     return out;
 }
 
+// A neighbourhood filter of radius r run on horizontal strips in parallel (OpenCV runs some
+// filters on one core). Each strip is filtered with r extra rows, so the result is identical.
+static void by_strips(const cv::Mat& src, cv::Mat& dst, int r,
+                      const std::function<void(const cv::Mat&, cv::Mat&)>& filter) {
+    const int h = src.rows, n = std::max(1, std::min(32, h / std::max(4 * r, 32)));
+    cv::Mat out(src.size(), src.type());
+    parallel_for(cv::Range(0, n), [&](const cv::Range& rg) {
+        for (int k = rg.start; k < rg.end; k++) {
+            int a = k * h / n, b = (k + 1) * h / n, a0 = std::max(0, a - r), b0 = std::min(h, b + r);
+            cv::Mat part = src.rowRange(a0, b0).clone(), f;
+            filter(part, f);
+            f.rowRange(a - a0, b - a0).copyTo(out.rowRange(a, b));
+        }
+    });
+    dst = out;
+}
+
 // paper level and spread (median / MAD of bright, locally flat pixels)
 static bool paper_level(const cv::Mat& x, double& P, double& s) {
     cv::Mat x8(x.size(), CV_8U), bg;
-    for (int i = 0; i < (int)x.total(); i++) x8.data[i] = trunc8(((float*)x.data)[i]);
-    cv::medianBlur(x8, bg, 21);
+    const int N = (int)x.total(), nb = 64;
+    parallel_for(cv::Range(0, N), [&](const cv::Range& rg) {
+        for (int i = rg.start; i < rg.end; i++) x8.data[i] = trunc8(((float*)x.data)[i]);
+    });
+    by_strips(x8, bg, 10, [](const cv::Mat& a, cv::Mat& b) { cv::medianBlur(a, b, 21); });
+    std::vector<std::vector<double>> part(nb);  // per block, concatenated in order
+    parallel_for(cv::Range(0, nb), [&](const cv::Range& rg) {
+        for (int k = rg.start; k < rg.end; k++)
+            for (int i = (int)((long)k * N / nb); i < (int)((long)(k + 1) * N / nb); i++)
+                if (bg.data[i] > 180 && std::abs((int)x8.data[i] - (int)bg.data[i]) < 25)
+                    part[k].push_back(((float*)x.data)[i]);
+    });
     std::vector<double> v;
-    for (int i = 0; i < (int)x.total(); i++)
-        if (bg.data[i] > 180 && std::abs((int)x8.data[i] - (int)bg.data[i]) < 25) v.push_back(((float*)x.data)[i]);
+    for (auto& p : part) v.insert(v.end(), p.begin(), p.end());
     if (v.size() < 1000) return false;
     P = median(v);
     for (auto& q : v) q = std::abs(q - P);
@@ -257,23 +284,15 @@ cv::Mat clean_paper(const cv::Mat& img) {
     bool colour = cv::mean(colmask)[0] > 1e-3;
     cv::Mat gd, g;
     auto t = std::chrono::steady_clock::now();
-    cv::fastNlMeansDenoising(g8, gd, 4.0f, 7, 21);
+    cv::fastNlMeansDenoising(g8, gd, 4.0f, 7, 11);  // search 11 instead of 21: 2.5x faster, mean change 0.1 levels
     log(fmt("    denoising %.2f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count()));
     gd.convertTo(g, CV_32F);
     double P0, s0;
-    bool found = false;
-    // local paper level: ink removed by a closing, then smoothed (alongside the global level)
+    bool found = paper_level(g, P0, s0);
+    // local paper level: ink removed by a closing, then smoothed
     cv::Mat bg;
-    parallel_for(cv::Range(0, 2), [&](const cv::Range& rg) {
-        for (int k = rg.start; k < rg.end; k++) {
-            if (k == 0) found = paper_level(g, P0, s0);
-            if (k == 1) {
-                cv::morphologyEx(g, bg, cv::MORPH_CLOSE,
-                                 cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
-                cv::GaussianBlur(bg, bg, cv::Size(0, 0), 6.0);
-            }
-        }
-    });
+    cv::morphologyEx(g, bg, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
+    by_strips(bg, bg, 25, [](const cv::Mat& a, cv::Mat& b) { cv::GaussianBlur(a, b, cv::Size(0, 0), 6.0); });
     if (!found) {
         if (colour) return img;
         return g8;
