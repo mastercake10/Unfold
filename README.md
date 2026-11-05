@@ -1,11 +1,15 @@
 # docscan3d
 
-Two photos of a folded/curved page → measured 3D surface → flat, scanner-like image.
+2–4 photos of a folded/curved page → measured 3D surface → flat, scanner-like image.
 
 ```
 pip install opencv-python numpy scipy pillow matplotlib
-python3 docscan3d.py view1.jpg view2.jpg -o out
+python3 docscan3d.py ref.jpg right.jpg up.jpg down.jpg -o out   # recommended: 4 views
+python3 docscan3d.py ref.jpg right.jpg -o out --focal-px 3030 --fixed-focal   # 2 views need a known focal
 ```
+
+The first image is the reference that gets rendered. With 4 views the focal length is self-calibrated
+(no checkerboard needed); with 2 views it is not observable, so pass it (Pixel 8, 16:9 mode: ~3030 px).
 
 ## Capture
 
@@ -38,6 +42,16 @@ python3 docscan3d.py view1.jpg view2.jpg -o out
 | `flat.png` | flattened page at `--dpi` (default 200) |
 | `overlay.jpg` | view 1 with detected page and points colored by height |
 | `report.json` | point count, reprojection error, baseline, distance, strain, ... |
+
+## Real-photo results (Pixel 8, 5 folded letters, vs. flatbed scan)
+
+`test/batch_real.sh` runs all samples and compares the output with the scans (`test/eval_real.py`).
+
+| | median | p95 | worst panel | coverage |
+|---|---|---|---|---|
+| 4-corner homography (what apps do) | 1.00 mm | 3.04 mm | 2.03 mm | 0.74 |
+| 2 views, known focal | 0.34 mm | 0.96 mm | 1.10 mm (one panel lost) | 0.72 |
+| 4 views, self-calibrated (default) | 0.30 mm | 0.73 mm | 0.67 mm | 0.78 |
 
 ## Synthetic test
 

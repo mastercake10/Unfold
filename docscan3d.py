@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two-view 3D reconstruction of a curved/folded document page.
+"""Multi-view 3D reconstruction and flattening of a curved/folded document page.
 
 Outputs measured surface points as (u, v, z) in mm:
   u, v  coordinates in the best-fit page plane, aligned to the page edges
@@ -156,26 +156,6 @@ def refine_quad(gray, quad, half=25, n=40):
 
 # ---------------------------------------------------------------- matching
 
-def match_features(g1, g2, mask1, n_features):
-    sift = cv2.SIFT_create(nfeatures=n_features, contrastThreshold=0.02)
-    k1, d1 = sift.detectAndCompute(g1, mask1)
-    k2, d2 = sift.detectAndCompute(g2, None)
-    log(f"  keypoints: {len(k1)} / {len(k2)}")
-    flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=64))
-    m12 = flann.knnMatch(d1, d2, k=2)
-    m21 = flann.knnMatch(d2, d1, k=2)
-    best21 = {m[0].queryIdx: m[0].trainIdx for m in m21 if len(m) == 2 and m[0].distance < 0.85 * m[1].distance}
-    p1, p2 = [], []
-    for m in m12:
-        if len(m) < 2 or m[0].distance > 0.85 * m[1].distance:
-            continue
-        if best21.get(m[0].trainIdx) != m[0].queryIdx:
-            continue
-        p1.append(k1[m[0].queryIdx].pt)
-        p2.append(k2[m[0].trainIdx].pt)
-    return np.float64(p1), np.float64(p2)
-
-
 def refine_subpixel(g1, g2, p1, p2, H_local=None, win=15, search=4):
     """NCC template matching of img1 patches (pre-warped by the local affine A)
     in a +-search window around p2, with parabolic subpixel peak."""
@@ -238,79 +218,214 @@ def local_affines(p1, p2, q=None, k=12):
     return A, pred
 
 
-def densify(g1, g2, mask, p1, p2, max_pts, min_dist, search):
-    """Guided matching: corners in img1, position in img2 predicted from nearby
-    sparse matches, then refined by NCC on affine-pre-warped patches."""
-    q = cv2.goodFeaturesToTrack(g1, max_pts, 0.005, min_dist, mask=mask, blockSize=5)
-    if q is None:
-        return np.empty((0, 2)), np.empty((0, 2))
-    q = q.reshape(-1, 2).astype(np.float64)
-    from scipy.spatial import cKDTree
-    d, _ = cKDTree(p1).query(q)
-    q = q[d < 200]  # only predict near existing matches
-    A, pred = local_affines(p1, p2, q)
-    r, ok = refine_subpixel(g1, g2, q, pred, A, win=21, search=search)
-    ok &= np.linalg.norm(r - pred, axis=1) < search - 1
-    return q[ok], r[ok]
+# ---------------------------------------------------------------- camera model
+# One shared pinhole camera with radial distortion (k1, k2) for all views.
+# View 0 is the reference: R = I, t = 0. World frame = reference camera frame.
+
+def cam_K(cam):
+    return np.array([[cam["f"], 0, cam["cx"]], [0, cam["f"], cam["cy"]], [0, 0, 1]])
 
 
-# ---------------------------------------------------------------- geometry
+def cam_dist(cam):
+    return np.array([cam["k1"], cam["k2"], 0, 0, 0], float)
+
+
+def distort_norm(xn, cam):
+    r2 = (xn ** 2).sum(-1, keepdims=True)
+    return xn * (1 + cam["k1"] * r2 + cam["k2"] * r2 * r2)
+
+
+def norm_to_px(xn, cam):
+    xd = distort_norm(xn, cam)
+    return np.c_[cam["f"] * xd[:, 0] + cam["cx"], cam["f"] * xd[:, 1] + cam["cy"]]
+
+
+def px_to_norm(px, cam):
+    return cv2.undistortPoints(px.reshape(-1, 1, 2).astype(np.float64), cam_K(cam), cam_dist(cam),
+                               criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 40, 1e-10)).reshape(-1, 2)
+
+
+def project(X, R, t, cam):
+    Xc = X @ R.T + t
+    return norm_to_px(Xc[:, :2] / Xc[:, 2:3], cam), Xc[:, 2]
+
+
+def cross2(a, b):
+    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
 
 def rodrigues(r):
-    return cv2.Rodrigues(r.reshape(3, 1))[0]
+    return cv2.Rodrigues(np.asarray(r, float).reshape(3, 1))[0]
 
 
-def project(K, R, t, X):
-    Xc = X @ R.T + t
-    x = Xc @ K.T
-    return x[:, :2] / x[:, 2:3], Xc[:, 2]
+def triangulate_multi(obs, Rs, ts, cam):
+    """N-view DLT. obs: (N, V, 2) pixels with NaN for missing observations."""
+    N, V, _ = obs.shape
+    A = np.zeros((N, 2 * V, 4))
+    for v in range(V):
+        ok = np.isfinite(obs[:, v, 0])
+        if not ok.any():
+            continue
+        xn = px_to_norm(obs[ok, v], cam)
+        P = np.hstack([Rs[v], ts[v].reshape(3, 1)])
+        A[ok, 2 * v] = xn[:, 0:1] * P[2] - P[0]
+        A[ok, 2 * v + 1] = xn[:, 1:2] * P[2] - P[1]
+    _, _, vt = np.linalg.svd(A)
+    Xh = vt[:, -1]
+    return Xh[:, :3] / Xh[:, 3:4]
 
 
-def triangulate(K, R, t, p1, p2):
-    P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
-    P2 = K @ np.hstack([R, t.reshape(3, 1)])
-    Xh = cv2.triangulatePoints(P1, P2, p1.T, p2.T)
-    return (Xh[:3] / Xh[3]).T
+def reproj_errors(X, obs, Rs, ts, cam):
+    N, V, _ = obs.shape
+    err = np.full((N, V), np.nan)
+    depth_ok = np.ones(N, bool)
+    for v in range(V):
+        p, z = project(X, Rs[v], ts[v], cam)
+        depth_ok &= z > 0
+        ok = np.isfinite(obs[:, v, 0])
+        err[ok, v] = np.linalg.norm(p[ok] - obs[ok, v], axis=1)
+    return err, depth_ok
 
 
-def bundle_adjust(K, R, t, X, p1, p2, refine_focal):
-    n = len(X)
-    t = t / np.linalg.norm(t)
-    f0 = K[0, 0]
+def bundle_adjust(cam, Rs, ts, obs, refine_f, n_dist, max_nfev=200):
+    """Reduced bundle adjustment: shared intrinsics and poses of views 1.. are the
+    only parameters; points are re-triangulated inside every evaluation.
+    Gauge: view 0 fixed, |t_1| fixed."""
+    V = len(Rs)
+    n_in = int(refine_f) + n_dist
+    t1n = np.linalg.norm(ts[1])
+    has = np.isfinite(obs[:, :, 0])
 
     def unpack(x):
-        r = x[:3]
-        tt = x[3:6]
-        df = x[6] if refine_focal else 0.0
-        Xs = x[6 + refine_focal:].reshape(n, 3)
-        Kc = K.copy()
-        Kc[0, 0] = Kc[1, 1] = f0 * (1 + df)
-        return rodrigues(r), tt, Kc, Xs
+        c = dict(cam)
+        k = 0
+        if refine_f:
+            c["f"] = cam["f"] * (1 + x[0]); k = 1
+        if n_dist >= 1:
+            c["k1"] = x[k]; k += 1
+        if n_dist >= 2:
+            c["k2"] = x[k]; k += 1
+        Rv, tv = [np.eye(3)], [np.zeros(3)]
+        for j in range(V - 1):
+            o = n_in + 6 * j
+            Rv.append(rodrigues(x[o:o + 3])); tv.append(x[o + 3:o + 6])
+        return c, Rv, tv
 
     def resid(x):
-        Rr, tt, Kc, Xs = unpack(x)
-        a, _ = project(Kc, np.eye(3), np.zeros(3), Xs)
-        b, _ = project(Kc, Rr, tt, Xs)
-        return np.concatenate([(a - p1).ravel(), (b - p2).ravel(),
-                               [1e3 * (tt @ tt - 1.0)]])
+        c, Rv, tv = unpack(x)
+        X = triangulate_multi(obs, Rv, tv, c)
+        r = []
+        for v in range(V):
+            p, z = project(X, Rv[v], tv[v], c)
+            d = p - obs[:, v]
+            d[~has[:, v] | (z <= 0)] = 0
+            r.append(d.ravel())
+        return np.r_[np.concatenate(r), 1e3 * (np.linalg.norm(tv[1]) - t1n) / t1n]
 
-    nc = 6 + refine_focal
-    S = sparse.lil_matrix((4 * n + 1, nc + 3 * n), dtype=int)
-    for i in range(n):
-        for rr in (2 * i, 2 * i + 1):
-            S[rr, nc + 3 * i:nc + 3 * i + 3] = 1
-            if refine_focal:
-                S[rr, 6] = 1
-        for rr in (2 * n + 2 * i, 2 * n + 2 * i + 1):
-            S[rr, :nc] = 1
-            S[rr, nc + 3 * i:nc + 3 * i + 3] = 1
-    S[4 * n, 3:6] = 1
+    x0 = [0.0] * int(refine_f) + [cam["k1"], cam["k2"]][:n_dist]
+    for j in range(1, V):
+        x0 += list(cv2.Rodrigues(Rs[j])[0].ravel()) + list(ts[j])
+    x0 = np.array(x0, float)
+    xs = np.r_[[0.01] * n_in, np.tile([0.01, 0.01, 0.01, 0.01 * t1n, 0.01 * t1n, 0.01 * t1n], V - 1)]
+    res = least_squares(resid, x0, loss="huber", f_scale=1.0, x_scale=xs, diff_step=1e-7,
+                        method="trf", max_nfev=max_nfev)
+    if os.environ.get("BA_DEBUG"):
+        r0 = resid(x0)[:-1]
+        log(f"    BA: status {res.status} nfev {res.nfev}, rms {np.sqrt(np.mean(r0[r0 != 0]**2)):.3f} -> "
+            f"{np.sqrt(np.mean(res.fun[:-1][res.fun[:-1] != 0]**2)):.3f}, intrinsics {res.x[:n_in]}")
+    return unpack(res.x)
 
-    x0 = np.concatenate([cv2.Rodrigues(R)[0].ravel(), t, [0.0] * refine_focal, X.ravel()])
-    res = least_squares(resid, x0, jac_sparsity=S, loss="huber", f_scale=1.0,
-                        x_scale="jac", method="trf", max_nfev=60, verbose=0)
-    Rr, tt, Kc, Xs = unpack(res.x)
-    return Rr, tt, Kc, Xs
+
+# ---------------------------------------------------------------- page outline
+
+def page_outline(gray, mask, step=4.0, half=18):
+    """Closed, ordered, subpixel page boundary in pixels (strongest edge along the
+    normal of the smoothed mask contour)."""
+    from scipy.ndimage import map_coordinates, gaussian_filter1d
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    c = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(float)
+    seg = np.linalg.norm(np.diff(np.vstack([c, c[:1]]), axis=0), axis=1)
+    cum = np.r_[0, np.cumsum(seg)]
+    tt = np.arange(0, cum[-1], step)
+    cc = np.vstack([c, c[:1]])
+    p = np.c_[np.interp(tt, cum, cc[:, 0]), np.interp(tt, cum, cc[:, 1])]
+    p = np.c_[gaussian_filter1d(p[:, 0], 4, mode="wrap"), gaussian_filter1d(p[:, 1], 4, mode="wrap")]
+    tan = np.roll(p, -1, 0) - np.roll(p, 1, 0)
+    tan /= np.linalg.norm(tan, axis=1, keepdims=True) + 1e-12
+    nrm = np.c_[-tan[:, 1], tan[:, 0]]
+    g = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.2)
+    offs = np.arange(-half, half + 1, dtype=float)
+    xy = p[:, None, :] + offs[None, :, None] * nrm[:, None, :]
+    prof = map_coordinates(g, [xy[..., 1].ravel(), xy[..., 0].ravel()], order=1, mode="nearest").reshape(len(p), -1)
+    gr = np.abs(np.gradient(prof, axis=1))
+    k = np.argmax(gr, axis=1)
+    ok = (k > 0) & (k < len(offs) - 1) & (gr[np.arange(len(p)), np.clip(k, 0, len(offs) - 1)] > 4)
+    kk = np.clip(k, 1, len(offs) - 2)
+    l, m, r = gr[np.arange(len(p)), kk - 1], gr[np.arange(len(p)), kk], gr[np.arange(len(p)), kk + 1]
+    den = l - 2 * m + r
+    sub = np.where(np.abs(den) > 1e-9, 0.5 * (l - r) / np.where(np.abs(den) > 1e-9, den, 1), 0)
+    out = p + (offs[kk] + sub)[:, None] * nrm
+    return out, ok
+
+
+def assign_edges(pts, quad, corner_excl=0.06):
+    """Edge index per outline point (0 top, 1 right, 2 bottom, 3 left in the image
+    quad order tl,tr,br,bl); -1 near corners."""
+    eid = np.full(len(pts), -1)
+    best = np.full(len(pts), np.inf)
+    for i in range(4):
+        a, b = quad[i], quad[(i + 1) % 4]
+        d = b - a
+        L = np.linalg.norm(d)
+        tpar = ((pts - a) @ d) / (L * L)
+        dist = np.abs(cross2(d / L, pts - a))
+        inner = (tpar > corner_excl) & (tpar < 1 - corner_excl)
+        better = inner & (dist < best) & (dist < 0.05 * L)
+        eid[better], best[better] = i, dist[better]
+    return eid
+
+
+def triangulate_outline(out0, outs, cam, Rs, ts, X_pred, min_sin=0.35, max_px=40.0):
+    """Match reference-outline points to other views' outlines along epipolar lines.
+    X_pred: rough 3D for each reference outline point (to pick the right crossing)."""
+    V = len(Rs)
+    obs = np.full((len(out0), V, 2), np.nan)
+    obs[:, 0] = out0
+    x0n = np.c_[px_to_norm(out0, cam), np.ones(len(out0))]
+    for j in range(1, V):
+        if outs[j] is None:
+            continue
+        pj = outs[j]
+        xjn = np.c_[px_to_norm(pj, cam), np.ones(len(pj))]
+        tx = np.array([[0, -ts[j][2], ts[j][1]], [ts[j][2], 0, -ts[j][0]], [-ts[j][1], ts[j][0], 0]])
+        Ej = tx @ Rs[j]
+        lines = x0n @ Ej.T
+        pred, _ = project(X_pred, Rs[j], ts[j], cam)
+        nxt = np.roll(xjn, -1, 0)
+        seg = nxt[:, :2] - xjn[:, :2]
+        segn = seg / (np.linalg.norm(seg, axis=1, keepdims=True) + 1e-12)
+        for i, l in enumerate(lines):
+            va = xjn @ l
+            vb = nxt @ l
+            cross = np.nonzero(va * vb < 0)[0]
+            if len(cross) == 0:
+                continue
+            tpar = va[cross] / (va[cross] - vb[cross])
+            pts = xjn[cross, :2] + tpar[:, None] * seg[cross]
+            ppx = norm_to_px(pts, cam)
+            d = np.linalg.norm(ppx - pred[i], axis=1)
+            k = int(np.argmin(d))
+            if d[k] > max_px:
+                continue
+            ldir = np.array([l[1], -l[0]]) / (np.hypot(l[0], l[1]) + 1e-12)
+            if abs(cross2(ldir, segn[cross[k]])) < min_sin:
+                continue
+            obs[i, j] = ppx[k]
+    has = np.isfinite(obs[:, 1:, 0]).any(1)
+    X = np.full((len(out0), 3), np.nan)
+    if has.any():
+        X[has] = triangulate_multi(obs[has], Rs, ts, cam)
+    return X, obs, has
 
 
 # ---------------------------------------------------------------- page frame
@@ -325,41 +440,44 @@ def fit_plane(X):
         c = X[keep].mean(0)
     _, _, vt = np.linalg.svd(X[keep] - c, full_matrices=False)
     n = vt[2]
-    if n @ c > 0:  # normal points towards camera 1 (origin)
+    if n @ c > 0:  # normal points towards the reference camera (origin)
         n = -n
     return c, n
 
 
-def ray_plane(K, px, c, n):
-    rays = np.c_[px, np.ones(len(px))] @ np.linalg.inv(K).T
+def rays_of(px, cam):
+    return np.c_[px_to_norm(px, cam), np.ones(len(px))]
+
+
+def ray_plane(rays, c, n):
     s = (c @ n) / (rays @ n)
     return rays * s[:, None]
 
 
-def page_frame(K, quad, c, n, page_w, page_h):
+def page_frame(cam, quad, c, n, page_w, page_h):
     """Origin at page corner, eu along short edge, ev along long edge, en = normal.
-    Returns frame and mm-per-unit scale (from the measured page outline)."""
-    C = ray_plane(K, quad, c, n)  # tl, tr, br, bl
+    Initial mm-per-unit scale from the outline projected onto the plane."""
+    C = ray_plane(rays_of(quad, cam), c, n)  # tl, tr, br, bl
     top, right = np.linalg.norm(C[1] - C[0]), np.linalg.norm(C[2] - C[1])
     bottom, left = np.linalg.norm(C[2] - C[3]), np.linalg.norm(C[3] - C[0])
     horiz, vert = (top + bottom) / 2, (left + right) / 2
-    if horiz <= vert:          # portrait in image: u = image-x direction
+    if horiz <= vert:
         o, ue, ve = C[0], C[1] - C[0], C[3] - C[0]
         short, long_ = horiz, vert
-    else:                      # landscape in image: rotate so u is the short edge
+        edge_map = {0: "top", 1: "right", 2: "bottom", 3: "left"}
+    else:
         o, ue, ve = C[3], C[0] - C[3], C[2] - C[3]
         short, long_ = vert, horiz
+        edge_map = {3: "top", 0: "right", 1: "bottom", 2: "left"}
     eu = ue - (ue @ n) * n
     eu /= np.linalg.norm(eu)
     ev = np.cross(n, eu)
     if ev @ ve < 0:
         n = -n
         ev = np.cross(n, eu)
-    # page outline measured in the plane is the projected size (slightly short
-    # where the sheet is tilted); good to ~1 % for typical folds
     scale = 0.5 * (page_w / short + page_h / long_)
-    return dict(o=o, eu=eu, ev=ev, en=n, scale=scale,
-                measured_mm=(short * scale, long_ * scale), corners=C)
+    return dict(o=o, eu=eu, ev=ev, en=n, scale=scale, edge_map=edge_map,
+                measured_mm=(short * scale, long_ * scale))
 
 
 def to_page(F, X):
@@ -374,56 +492,50 @@ def from_page(F, U):
 
 # ---------------------------------------------------------------- height field
 
-def fit_heightfield(uvz, W, H, step, lam, n_irls=6):
+def fit_heightfield(uvz, bounds, step, lam, n_irls=6, w=None):
     """Robust smooth z(u,v) on a grid: bilinear data term + second-difference
     regularizer, both IRLS-Huber so creases stay sharp-ish and outliers drop out."""
-    gu = np.arange(-step, W + 2 * step, step)
-    gv = np.arange(-step, H + 2 * step, step)
+    u0, u1, v0, v1 = bounds
+    gu = np.arange(u0, u1 + step, step)
+    gv = np.arange(v0, v1 + step, step)
     nu, nv = len(gu), len(gv)
     N = nu * nv
-    idx = lambda i, j: j * nu + i
+    idx = np.arange(N).reshape(nv, nu)
 
     u, v, z = uvz.T
+    w = np.ones(len(z)) if w is None else w
     fi = (u - gu[0]) / step
     fj = (v - gv[0]) / step
     inside = (fi >= 0) & (fi < nu - 1) & (fj >= 0) & (fj < nv - 1)
-    u, v, z, fi, fj = u[inside], v[inside], z[inside], fi[inside], fj[inside]
+    z, fi, fj, w = z[inside], fi[inside], fj[inside], w[inside]
     i0, j0 = np.floor(fi).astype(int), np.floor(fj).astype(int)
     a, b = fi - i0, fj - j0
     rows = np.repeat(np.arange(len(z)), 4)
-    cols = np.stack([idx(i0, j0), idx(i0 + 1, j0), idx(i0, j0 + 1), idx(i0 + 1, j0 + 1)], 1).ravel()
+    cols = np.stack([idx[j0, i0], idx[j0, i0 + 1], idx[j0 + 1, i0], idx[j0 + 1, i0 + 1]], 1).ravel()
     vals = np.stack([(1 - a) * (1 - b), a * (1 - b), (1 - a) * b, a * b], 1).ravel()
     A = sparse.csr_matrix((vals, (rows, cols)), shape=(len(z), N))
 
-    r, c, vv = [], [], []
-    k = 0
-    for j in range(nv):
-        for i in range(1, nu - 1):
-            r += [k] * 3; c += [idx(i - 1, j), idx(i, j), idx(i + 1, j)]; vv += [1, -2, 1]; k += 1
-    for j in range(1, nv - 1):
-        for i in range(nu):
-            r += [k] * 3; c += [idx(i, j - 1), idx(i, j), idx(i, j + 1)]; vv += [1, -2, 1]; k += 1
-    D = sparse.csr_matrix((vv, (r, c)), shape=(k, N))
+    tri = []
+    tri.append(np.stack([idx[:, :-2].ravel(), idx[:, 1:-1].ravel(), idx[:, 2:].ravel()], 1))
+    tri.append(np.stack([idx[:-2, :].ravel(), idx[1:-1, :].ravel(), idx[2:, :].ravel()], 1))
+    tri = np.concatenate(tri)
+    k = len(tri)
+    D = sparse.csr_matrix((np.tile([1.0, -2.0, 1.0], k), (np.repeat(np.arange(k), 3), tri.ravel())), shape=(k, N))
 
-    # lam is per unit area; scale so it is independent of point density
-    dens = len(z) / (W * H) * step * step
-    wd = np.ones(len(z))
+    area = (u1 - u0) * (v1 - v0)
+    dens = w.sum() / area * step * step
+    wd = w.copy()
     wr = np.ones(k) * lam * dens
-    zz = np.zeros(N)
     for _ in range(n_irls):
-        Wd = sparse.diags(wd)
-        Wr = sparse.diags(wr)
-        M = A.T @ Wd @ A + D.T @ Wr @ D + 1e-9 * sparse.eye(N)
+        M = A.T @ sparse.diags(wd) @ A + D.T @ sparse.diags(wr) @ D + 1e-9 * sparse.eye(N)
         zz = spsolve(M.tocsc(), A.T @ (wd * z))
         rd = A @ zz - z
         sd = 1.4826 * np.median(np.abs(rd)) + 1e-6
-        wd = np.minimum(1.0, 2 * sd / (np.abs(rd) + 1e-12))
+        wd = w * np.minimum(1.0, 2 * sd / (np.abs(rd) + 1e-12))
         rr = D @ zz
         sr = 1.4826 * np.median(np.abs(rr)) + 1e-6
         wr = lam * dens * np.minimum(1.0, 3 * sr / (np.abs(rr) + 1e-12))
-    Z = zz.reshape(nv, nu)
-    resid = A @ zz - z
-    return gu, gv, Z, resid
+    return gu, gv, zz.reshape(nv, nu), A @ zz - z
 
 
 def sample_heightfield(gu, gv, Z, U, V):
@@ -436,29 +548,63 @@ def sample_heightfield(gu, gv, Z, U, V):
             + (1 - a) * b * Z[j0 + 1, i0] + a * b * Z[j0 + 1, i0 + 1])
 
 
-def ray_surface(K, px, F, gu, gv, Z, c, n):
-    """Intersect camera-1 rays with the measured surface (bisection along the ray)."""
-    rays = np.c_[px, np.ones(len(px))] @ np.linalg.inv(K).T
+def ray_surface(rays, F, gu, gv, Z, c, n, iters=50):
+    """Intersect reference-camera rays with the measured surface (vectorized bisection)."""
     lam0 = (c @ n) / (rays @ n)
-    out = []
-    for r, l0 in zip(rays, lam0):
-        def f(lam):
-            uvz = to_page(F, (lam * r)[None])[0]
-            return uvz[2] - sample_heightfield(gu, gv, Z, uvz[:1], uvz[1:2])[0]
-        lo, hi = 0.85 * l0, 1.15 * l0
-        flo, fhi = f(lo), f(hi)
-        if flo * fhi > 0:
-            out.append(l0 * r)
-            continue
-        for _ in range(60):
-            mid = 0.5 * (lo + hi)
-            fm = f(mid)
-            if flo * fm <= 0:
-                hi = mid
-            else:
-                lo, flo = mid, fm
-        out.append(0.5 * (lo + hi) * r)
-    return np.array(out)
+
+    def f(lam):
+        uvz = to_page(F, rays * lam[:, None])
+        return uvz[:, 2] - sample_heightfield(gu, gv, Z, uvz[:, 0], uvz[:, 1])
+
+    lo, hi = 0.8 * lam0, 1.2 * lam0
+    flo, fhi = f(lo), f(hi)
+    ok = flo * fhi <= 0
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        fm = f(mid)
+        left = flo * fm <= 0
+        hi = np.where(left, mid, hi)
+        lo = np.where(left, lo, mid)
+        flo = np.where(left, flo, fm)
+    lam = np.where(ok, 0.5 * (lo + hi), lam0)
+    return rays * lam[:, None], ok
+
+
+def sample_grid2(st, gu, gv, U, V):
+    sx = ((U - gu[0]) / (gu[1] - gu[0])).astype(np.float32)[:, None]
+    sy = ((V - gv[0]) / (gv[1] - gv[0])).astype(np.float32)[:, None]
+    return np.stack([cv2.remap(st[..., k].astype(np.float32), sx, sy, cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)[:, 0] for k in range(2)], 1).astype(float)
+
+
+def fit_rectangle(st, side, W, H, x0):
+    """Similarity (k, theta, tx, ty) putting flattened outline points on the W x H
+    rectangle; side: 0 top, 1 right, 2 bottom, 3 left (page frame)."""
+    def xf(x, p):
+        k, th, tx, ty = x
+        R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+        return k * p @ R.T + [tx, ty]
+
+    target = np.array([0.0, W, H, 0.0])
+    axis = np.array([1, 0, 1, 0])
+
+    def resid(x):
+        q = xf(x, st)
+        return q[np.arange(len(q)), axis[side]] - target[side]
+
+    res = least_squares(resid, x0, loss="soft_l1", f_scale=0.3)
+    r = resid(res.x)
+    return res.x, xf, r
+
+
+def corners_init(st_c, W, H):
+    dst = np.array([[0, 0], [W, 0], [W, H], [0, H]], float)
+    a, b = st_c - st_c.mean(0), dst - dst.mean(0)
+    U_, _, Vt = np.linalg.svd(b.T @ a)
+    D = np.diag([1, np.sign(np.linalg.det(U_ @ Vt))])
+    R = U_ @ D @ Vt
+    t = dst.mean(0) - R @ st_c.mean(0)
+    return np.array([1.0, np.arctan2(R[1, 0], R[0, 0]), t[0], t[1]])
 
 
 def flatten_grid(gu, gv, Z):
@@ -493,17 +639,6 @@ def flatten_grid(gu, gv, Z):
     st = res.x.reshape(nv_, nu_, 2)
     strain = np.abs(resid(res.x)[:m]) / L
     return st, float(np.median(strain)), float(strain.max())
-
-
-def align_flat(st, corners_st, W, H):
-    """Rigid 2D transform taking the flat page corners to the W x H rectangle."""
-    dst = np.array([[0, 0], [W, 0], [W, H], [0, H]], float)
-    a, b = corners_st - corners_st.mean(0), dst - dst.mean(0)
-    U_, _, Vt = np.linalg.svd(b.T @ a)
-    D = np.diag([1, np.sign(np.linalg.det(U_ @ Vt))])
-    R = U_ @ D @ Vt
-    t = dst.mean(0) - R @ corners_st.mean(0)
-    return st @ R.T + t, corners_st @ R.T + t
 
 
 def flat_to_uv(st_grid, gu, gv, W, H, res_mm=0.5):
@@ -553,249 +688,343 @@ def save_heightmap_png(path, gu, gv, Z, uvz, W, H):
     plt.close(fig)
 
 
-def render_flat(img, K, dist, F, gu, gv, Z, W, H, dpi, inv=None, R=None, t=None):
-    """Output pixel (s, t) on the flat page -> surface point (u, v, z(u, v)) ->
-    pixel in the photo. Without `inv`, (s, t) = (u, v), i.e. plane projection only."""
+def render_flat(img, cam, F, gu, gv, Z, W, H, dpi, inv, R=None, t=None):
+    """Output pixel (s, t) -> surface point (u, v, z(u, v)) -> pixel in the photo."""
     ppm = dpi / 25.4
     ow, oh = int(round(W * ppm)), int(round(H * ppm))
-    if inv is None:
-        U, V = np.meshgrid((np.arange(ow) + 0.5) / ppm, (np.arange(oh) + 0.5) / ppm)
-    else:
-        u_r, v_r, res_mm = inv
-        sx = ((np.arange(ow) + 0.5) / ppm / res_mm).astype(np.float32)
-        sy = ((np.arange(oh) + 0.5) / ppm / res_mm).astype(np.float32)
-        MX, MY = np.meshgrid(sx, sy)
-        U = cv2.remap(u_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        V = cv2.remap(v_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        bad = ~np.isfinite(U) | ~np.isfinite(V)
-        U[bad], V[bad] = -1e4, -1e4
+    u_r, v_r, res_mm = inv
+    sx = ((np.arange(ow) + 0.5) / ppm / res_mm).astype(np.float32)
+    sy = ((np.arange(oh) + 0.5) / ppm / res_mm).astype(np.float32)
+    MX, MY = np.meshgrid(sx, sy)
+    U = cv2.remap(u_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    V = cv2.remap(v_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    bad = ~np.isfinite(U) | ~np.isfinite(V)
+    U[bad], V[bad] = -1e4, -1e4
     Zs = sample_heightfield(gu, gv, Z, U.ravel(), V.ravel())
     X = from_page(F, np.c_[U.ravel(), V.ravel(), Zs])
-    if R is None:
-        R, t = np.eye(3), np.zeros(3)
-    rv = cv2.Rodrigues(R)[0]
-    px, _ = cv2.projectPoints(X.reshape(-1, 1, 3), rv, t.reshape(3, 1), K, dist)
-    mx = px[:, 0, 0].reshape(oh, ow).astype(np.float32)
-    my = px[:, 0, 1].reshape(oh, ow).astype(np.float32)
+    R = np.eye(3) if R is None else R
+    t = np.zeros(3) if t is None else t
+    px, _ = project(X, R, t, cam)
+    mx = px[:, 0].reshape(oh, ow).astype(np.float32)
+    my = px[:, 1].reshape(oh, ow).astype(np.float32)
     return cv2.remap(img, mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+
+
+def match_ref(kp0, d0, g, mask, n_features):
+    sift = cv2.SIFT_create(nfeatures=n_features, contrastThreshold=0.02)
+    kp, d = sift.detectAndCompute(g, mask)
+    flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=64))
+    m01 = flann.knnMatch(d0, d, k=2)
+    m10 = flann.knnMatch(d, d0, k=2)
+    back = {m[0].queryIdx: m[0].trainIdx for m in m10 if len(m) == 2 and m[0].distance < 0.85 * m[1].distance}
+    i0, pj = [], []
+    for m in m01:
+        if len(m) == 2 and m[0].distance < 0.85 * m[1].distance and back.get(m[0].trainIdx) == m[0].queryIdx:
+            i0.append(m[0].queryIdx)
+            pj.append(kp[m[0].trainIdx].pt)
+    return np.array(i0, int), np.float64(pj), len(kp)
+
+
+def densify_multi(g0, gs, mask, p_ref, X, cam, Rs, ts, max_pts, min_dist, search):
+    """Guided matching from reference corners into every other view: position
+    predicted by projecting nearby reconstructed points, refined by NCC."""
+    from scipy.spatial import cKDTree
+    q = cv2.goodFeaturesToTrack(g0, max_pts, 0.005, min_dist, mask=mask, blockSize=5)
+    if q is None:
+        return np.empty((0, 2)), np.empty((0, len(Rs), 2))
+    q = q.reshape(-1, 2).astype(np.float64)
+    d, _ = cKDTree(p_ref).query(q)
+    q = q[d < 200]
+    obs = np.full((len(q), len(Rs), 2), np.nan)
+    obs[:, 0] = q
+    for j in range(1, len(Rs)):
+        pj, _ = project(X, Rs[j], ts[j], cam)
+        A, pred = local_affines(p_ref, pj, q)
+        r, ok = refine_subpixel(g0, gs[j], q, pred, A, win=21, search=search)
+        ok &= np.linalg.norm(r - pred, axis=1) < search - 1
+        obs[ok, j] = r[ok]
+    keep = np.isfinite(obs[:, 1:, 0]).any(1)
+    return q[keep], obs[keep]
+
+
+def clean_obs(X, obs, Rs, ts, cam, thr):
+    """Drop single observations with reprojection error > thr, retriangulate,
+    and keep points still seen in the reference and at least one other view."""
+    for _ in range(2):
+        err, dok = reproj_errors(X, obs, Rs, ts, cam)
+        bad = err > thr
+        obs = obs.copy()
+        obs[bad] = np.nan
+        keep = dok & np.isfinite(obs[:, 0, 0]) & np.isfinite(obs[:, 1:, 0]).any(1)
+        obs, X = obs[keep], X[keep]
+        X = triangulate_multi(obs, Rs, ts, cam)
+    err, dok = reproj_errors(X, obs, Rs, ts, cam)
+    keep = dok & ~(err > thr).any(1)
+    return X[keep], obs[keep], err[keep]
 
 
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("image1", help="reference view (should show the whole page)")
-    ap.add_argument("image2", help="second view, ~10-20 cm sideways from the first")
+    ap.add_argument("images", nargs="+", help="reference view first, then 1-3 more views (left/right/up/down)")
     ap.add_argument("-o", "--out", default="out")
     ap.add_argument("--page-size", default="210x297", help="page W x H in mm (default A4)")
     ap.add_argument("--focal-px", type=float, help="focal length in pixels at full resolution")
     ap.add_argument("--calib", help="npz with K, dist (and optionally size=(w,h)) from cv2.calibrateCamera")
-    ap.add_argument("--fixed-focal", action="store_true", help="do not refine the focal length in bundle adjustment")
-    ap.add_argument("--max-side", type=int, default=4000, help="downscale longer side to this many px")
+    ap.add_argument("--fixed-focal", action="store_true", help="do not refine the focal length")
+    ap.add_argument("--distortion", type=int, default=0, choices=(0, 1, 2),
+                    help="radial distortion terms refined in bundle adjustment (0, k1, k1+k2)")
+    ap.add_argument("--max-side", type=int, default=4100, help="downscale longer side to this many px")
     ap.add_argument("--features", type=int, default=60000)
-    ap.add_argument("--ba-points", type=int, default=6000, help="points used in bundle adjustment")
-    ap.add_argument("--grid", type=float, default=4.0, help="height-field grid spacing in mm")
-    ap.add_argument("--smooth", type=float, default=30.0, help="height-field smoothness weight")
-    ap.add_argument("--dpi", type=int, default=200, help="dpi of flattened preview")
-    ap.add_argument("--no-subpixel", action="store_true")
+    ap.add_argument("--ba-points", type=int, default=5000, help="points used in bundle adjustment")
+    ap.add_argument("--grid", type=float, help="height-field grid spacing in mm (default 2.5 with 3+ views, else 4)")
+    ap.add_argument("--smooth", type=float, help="height-field smoothness (default 10 with 3+ views, else 30)")
+    ap.add_argument("--dpi", type=int, default=200, help="dpi of the flattened output")
     ap.add_argument("--no-densify", action="store_true")
+    ap.add_argument("--no-outline", action="store_true", help="do not triangulate the page outline")
     ap.add_argument("--dense", type=int, default=40000, help="max candidate points for densification")
     args = ap.parse_args()
+    if len(args.images) < 2:
+        sys.exit("need at least two images")
 
     os.makedirs(args.out, exist_ok=True)
     W, H = map(float, args.page_size.lower().split("x"))
+    V = len(args.images)
+    if args.grid is None:
+        args.grid = 2.5 if V >= 3 else 4.0
+    if args.smooth is None:
+        args.smooth = 10.0 if V >= 3 else 30.0
 
-    img1, s1 = load_image(args.image1, args.max_side)
-    img2, s2 = load_image(args.image2, args.max_side)
-    h1, w1 = img1.shape[:2]
-    h2, w2 = img2.shape[:2]
-    K1, dist1, ksrc = build_K(args, args.image1, w1, h1)
-    K2, dist2, _ = build_K(args, args.image2, w2, h2)
-    if (h1, w1) != (h2, w2) or not np.allclose(K1, K2):
-        sys.exit("both images must come from the same camera at the same resolution")
-    K, dist = K1, dist1
-    log(f"focal: {K[0,0]:.1f} px ({ksrc})")
+    imgs, scales = zip(*[load_image(p, args.max_side) for p in args.images])
+    if len({im.shape for im in imgs}) != 1:
+        sys.exit("all images must come from the same camera at the same resolution")
+    h, w = imgs[0].shape[:2]
+    K, dist, ksrc = build_K(args, args.images[0], w, h)
+    s = scales[0]
+    cam = dict(f=K[0, 0] * s, cx=(K[0, 2] + 0.5) * s - 0.5, cy=(K[1, 2] + 0.5) * s - 0.5,
+               k1=float(dist[0]), k2=float(dist[1]))
+    if args.calib:
+        args.fixed_focal, n_dist = True, 0
+    else:
+        n_dist = args.distortion
+    full0 = imgs[0]
+    imgs = [cv2.resize(im, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else im for im in imgs]
+    gs = [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in imgs]
+    log(f"{V} views, focal start {cam['f'] / s:.1f} px ({ksrc})")
 
-    if np.any(dist):
-        img1 = cv2.undistort(img1, K, dist)
-        img2 = cv2.undistort(img2, K, dist)
-        dist = np.zeros(5)
-    full1 = img1
-    if s1 < 1:
-        img1 = cv2.resize(img1, None, fx=s1, fy=s1, interpolation=cv2.INTER_AREA)
-        img2 = cv2.resize(img2, None, fx=s2, fy=s2, interpolation=cv2.INTER_AREA)
-        K = K.copy(); K[:2] *= s1
-        log(f"processing at {img1.shape[1]}x{img1.shape[0]}")
+    log("page outlines ...")
+    quads, masks = [], []
+    for j, im in enumerate(imgs):
+        q, m = find_page_quad(im)
+        if q is None:
+            if j == 0:
+                sys.exit("could not find the page in the reference image")
+            quads.append(None); masks.append(None)
+            continue
+        quads.append(refine_quad(gs[j], q)); masks.append(m)
+    quad = quads[0]
+    mask_er = cv2.erode(masks[0], np.ones((15, 15), np.uint8))
 
-    log("page outline ...")
-    quad, mask1 = find_page_quad(img1)
-    if quad is None:
-        sys.exit("could not find the page in image1 (needs a page brighter than the background)")
-    q0 = quad.copy()
-    quad = refine_quad(cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY), quad)
-    log(f"  corners refined by {np.linalg.norm(quad - q0, axis=1).round(1).tolist()} px")
-    mask_er = cv2.erode(mask1, np.ones((15, 15), np.uint8))
-
-    g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
-    g2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
     log("matching ...")
-    p1, p2 = match_features(g1, g2, mask_er, args.features)
-    log(f"  mutual matches: {len(p1)}")
-    if len(p1) < 50:
-        sys.exit("too few matches")
+    sift = cv2.SIFT_create(nfeatures=args.features, contrastThreshold=0.02)
+    kp0, d0 = sift.detectAndCompute(gs[0], mask_er)
+    P0 = np.float64([k.pt for k in kp0])
+    obs = np.full((len(kp0), V, 2), np.nan)
+    obs[:, 0] = P0
+    Rs, ts = [np.eye(3)], [np.zeros(3)]
+    Ks = cam_K(cam)
+    for j in range(1, V):
+        mj = cv2.dilate(masks[j], np.ones((41, 41), np.uint8)) if masks[j] is not None else None
+        i0, pj, nk = match_ref(kp0, d0, gs[j], mj, args.features)
+        E, inl = cv2.findEssentialMat(P0[i0], pj, Ks, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=1.0)
+        inl = inl.ravel().astype(bool)
+        i0, pj = i0[inl], pj[inl]
+        _, R, t, _ = cv2.recoverPose(E, P0[i0], pj, Ks)
+        A, _ = local_affines(P0[i0], pj)
+        pr, ok = refine_subpixel(gs[0], gs[j], P0[i0], pj, A)
+        ok &= np.linalg.norm(pr - pj, axis=1) < 1.5
+        obs[i0[ok], j] = pr[ok]
+        Rs.append(R); ts.append(t.ravel())
+        log(f"  view {j}: {nk} keypoints, {len(i0)} inliers, {ok.sum()} refined")
 
-    E, inl = cv2.findEssentialMat(p1, p2, K, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=1.0)
-    inl = inl.ravel().astype(bool)
-    p1, p2 = p1[inl], p2[inl]
-    _, R, t, _ = cv2.recoverPose(E, p1, p2, K)
-    t = t.ravel()
-    log(f"  essential-matrix inliers: {len(p1)}")
+    # put all views on the scale of view 1 (depth ratios along shared reference rays)
+    keep = np.isfinite(obs[:, 1:, 0]).any(1)
+    obs = obs[keep]
+    base = np.isfinite(obs[:, 1, 0])
+    X1 = triangulate_multi(obs[base][:, [0, 1]], Rs[:2], ts[:2], cam)
+    for j in range(2, V):
+        both = base & np.isfinite(obs[:, j, 0])
+        if both.sum() < 20:
+            sys.exit(f"view {j} shares too few points with view 1")
+        Xj = triangulate_multi(obs[both][:, [0, j]], [Rs[0], Rs[j]], [ts[0], ts[j]], cam)
+        ts[j] = ts[j] * np.median(X1[both[base]][:, 2] / Xj[:, 2])
 
-    if not args.no_subpixel:
-        log("subpixel refinement ...")
-        A, _ = local_affines(p1, p2)
-        p2r, ok = refine_subpixel(g1, g2, p1, p2, A)
-        moved = np.linalg.norm(p2r - p2, axis=1)
-        ok &= moved < 1.5
-        p1, p2 = p1[ok], p2r[ok]
-        log(f"  kept {len(p1)} (median shift {np.median(moved[ok]):.2f} px)")
-
-    X = triangulate(K, R, t, p1, p2)
-    a, z1 = project(K, np.eye(3), np.zeros(3), X)
-    b, z2 = project(K, R, t, X)
-    err = np.maximum(np.linalg.norm(a - p1, axis=1), np.linalg.norm(b - p2, axis=1))
-    good = (z1 > 0) & (z2 > 0) & (err < 2.0)
-    p1, p2, X = p1[good], p2[good], X[good]
+    X = triangulate_multi(obs, Rs, ts, cam)
+    X, obs, _ = clean_obs(X, obs, Rs, ts, cam, 3.0)
 
     log("bundle adjustment ...")
-    rng = np.random.default_rng(0)
-    sel = rng.choice(len(X), min(args.ba_points, len(X)), replace=False)
-    R, t, K, _ = bundle_adjust(K, R, t, X[sel], p1[sel], p2[sel], int(not args.fixed_focal))
-    X = triangulate(K, R, t, p1, p2)
-    a, z1 = project(K, np.eye(3), np.zeros(3), X)
-    b, z2 = project(K, R, t, X)
-    e1 = np.linalg.norm(a - p1, axis=1)
-    e2 = np.linalg.norm(b - p2, axis=1)
-    err = np.maximum(e1, e2)
-    good = (z1 > 0) & (z2 > 0) & (err < 1.0)
-    p1, p2, X, err = p1[good], p2[good], X[good], err[good]
-
-    cam2 = -R.T @ t
-    ang = np.degrees(np.arccos(np.clip(
-        np.einsum("ij,ij->i", X / np.linalg.norm(X, axis=1, keepdims=True),
-                  (X - cam2) / np.linalg.norm(X - cam2, axis=1, keepdims=True)), -1, 1)))
-    log(f"  points: {len(X)}, reprojection rms {np.sqrt(np.mean(e1[good]**2 + e2[good]**2) / 2):.3f} px, "
-        f"triangulation angle median {np.median(ang):.1f} deg")
-    if np.median(ang) < 4:
-        log("  WARNING: small baseline; move the phone further between the two shots")
+    for it in range(2):
+        rng = np.random.default_rng(it)
+        sel = rng.choice(len(X), min(args.ba_points, len(X)), replace=False)
+        cam, Rs, ts = bundle_adjust(cam, Rs, ts, obs[sel], not args.fixed_focal, n_dist)
+        X = triangulate_multi(obs, Rs, ts, cam)
+        X, obs, err = clean_obs(X, obs, Rs, ts, cam, 1.0 if it else 2.0)
+    rms = np.sqrt(np.nanmean(err ** 2))
+    cams_c = [-R.T @ t for R, t in zip(Rs, ts)]
+    log(f"  points {len(X)}, reprojection rms {rms:.3f} px, focal {cam['f'] / s:.1f} px, "
+        f"k1 {cam['k1']:.4f}, k2 {cam['k2']:.4f}")
 
     c, n = fit_plane(X)
-    F = page_frame(K, quad, c, n, W, H)
+    F = page_frame(cam, quad, c, n, W, H)
     uvz = to_page(F, X)
+    bnd = (-15.0, W + 15.0, -15.0, H + 15.0)
 
     if not args.no_densify:
         log("densifying ...")
-        gu0, gv0, Z0, _ = fit_heightfield(uvz, W, H, 2 * args.grid, args.smooth)
-        mind = max(4, int(round(min(g1.shape) / 400)))
-        q1, q2 = densify(g1, g2, mask_er, p1, p2, args.dense, mind, search=6)
-        Xd = triangulate(K, R, t, q1, q2)
-        a, za = project(K, np.eye(3), np.zeros(3), Xd)
-        b, zb = project(K, R, t, Xd)
-        ed = np.maximum(np.linalg.norm(a - q1, axis=1), np.linalg.norm(b - q2, axis=1))
+        gu0, gv0, Z0, _ = fit_heightfield(uvz, bnd, 2 * args.grid, args.smooth)
+        mind = max(4, int(round(min(gs[0].shape) / 400)))
+        q, dobs = densify_multi(gs[0], gs, mask_er, obs[:, 0], X, cam, Rs, ts, args.dense, mind, search=6)
+        Xd = triangulate_multi(dobs, Rs, ts, cam)
+        Xd, dobs, derr = clean_obs(Xd, dobs, Rs, ts, cam, 1.0)
         uvzd = to_page(F, Xd)
         dz = uvzd[:, 2] - sample_heightfield(gu0, gv0, Z0, uvzd[:, 0], uvzd[:, 1])
-        # wrong-letter matches slide along the epipolar line and show up as depth outliers
-        keep = (za > 0) & (zb > 0) & (ed < 1.0) & (np.abs(dz) < 1.0)
-        log(f"  candidates {len(q1)}, kept {keep.sum()}")
-        p1 = np.r_[p1, q1[keep]]
-        p2 = np.r_[p2, q2[keep]]
-        X = np.r_[X, Xd[keep]]
-        err = np.r_[err, ed[keep]]
-        uvz = np.r_[uvz, uvzd[keep]]
-        dup = np.unique(np.round(p1 / 2.0), axis=0, return_index=True)[1]
-        p1, p2, X, err, uvz = p1[dup], p2[dup], X[dup], err[dup], uvz[dup]
+        ok = np.abs(dz) < 1.0
+        log(f"  candidates {len(q)}, kept {ok.sum()}")
+        X = np.r_[X, Xd[ok]]
+        obs = np.r_[obs, dobs[ok]]
+        err = np.r_[err, derr[ok]]
+        dup = np.unique(np.round(obs[:, 0] / 2.0), axis=0, return_index=True)[1]
+        X, obs, err = X[dup], obs[dup], err[dup]
+        uvz = to_page(F, X)
         log(f"  total points {len(X)}")
 
-    log(f"  page outline in plane: {F['measured_mm'][0]:.1f} x {F['measured_mm'][1]:.1f} mm (after scaling)")
-    log(f"  baseline: {np.linalg.norm(cam2) * F['scale']:.0f} mm, "
-        f"distance to page: {np.median(X[:, 2]) * F['scale']:.0f} mm")
+    n_views = np.isfinite(obs[:, :, 0]).sum(1)
+    ang = []
+    for j in range(1, V):
+        m = np.isfinite(obs[:, j, 0])
+        a = X[m] / np.linalg.norm(X[m], axis=1, keepdims=True)
+        b = (X[m] - cams_c[j]) / np.linalg.norm(X[m] - cams_c[j], axis=1, keepdims=True)
+        ang.append(np.degrees(np.arccos(np.clip((a * b).sum(1), -1, 1))))
+    ang_med = float(np.median(np.concatenate(ang)))
+    log(f"  views per point: {np.bincount(n_views)[2:].tolist()} (2, 3, ...), "
+        f"triangulation angle median {ang_med:.1f} deg")
 
-    # Scale and origin come from the page outline. Corners first come from the
-    # plane; afterwards they are re-intersected with the measured surface and the
-    # outline is measured after flattening (true arc length), then everything is redone.
+    # page outline in the reference view, and its 3D where triangulable
+    out0, ok0 = page_outline(gs[0], masks[0])
+    out0 = out0[ok0]
+    eid = assign_edges(out0, quad)
+    side = np.array([{"top": 0, "right": 1, "bottom": 2, "left": 3}[F["edge_map"][e]] if e >= 0 else -1
+                     for e in eid])
+    Xb = np.empty((0, 3))
+    if not args.no_outline:
+        log("outline ...")
+        outs = [None] + [page_outline(gs[j], masks[j])[0] if masks[j] is not None else None for j in range(1, V)]
+        gu0, gv0, Z0, _ = fit_heightfield(uvz, bnd, 2 * args.grid, args.smooth)
+        Xp, _ = ray_surface(rays_of(out0, cam), F, gu0, gv0, Z0, c, n)
+        Xb, bobs, has = triangulate_outline(out0, outs, cam, Rs, ts, Xp)
+        bobs, bside = bobs[has], side[has]
+        Xb = Xb[has]
+        if len(Xb):
+            # drop the worst inconsistent observation per point until the rest agree
+            for _ in range(V - 1):
+                berr, _ = reproj_errors(Xb, bobs, Rs, ts, cam)
+                worst = np.nanargmax(np.where(np.isfinite(berr[:, 1:]), berr[:, 1:], -1), axis=1) + 1
+                bad = np.nanmax(berr, 1) >= 1.5
+                if not bad.any():
+                    break
+                bobs[np.nonzero(bad)[0], worst[bad]] = np.nan
+                still = np.isfinite(bobs[:, 1:, 0]).any(1)
+                bobs, bside, Xb = bobs[still], bside[still], Xb[still]
+                Xb = triangulate_multi(bobs, Rs, ts, cam)
+            berr, bdok = reproj_errors(Xb, bobs, Rs, ts, cam)
+            uvzb = to_page(F, Xb)
+            dzb = uvzb[:, 2] - sample_heightfield(gu0, gv0, Z0, uvzb[:, 0], uvzb[:, 1])
+            okb = bdok & (np.nanmax(berr, 1) < 1.5) & (np.abs(dzb) < 8.0) & (bside >= 0)
+            if os.environ.get("BA_DEBUG"):
+                for sd in range(4):
+                    m = bside == sd
+                    log(f"    side {sd}: {m.sum()} matched, depth ok {(bdok & m).sum()}, "
+                        f"reproj ok {(m & (np.nanmax(berr, 1) < 1.5)).sum()}, dz ok {(m & (np.abs(dzb) < 8)).sum()}, "
+                        f"dz median {np.median(np.abs(dzb[m])) if m.any() else 0:.1f} mm")
+            Xb, bside = Xb[okb], bside[okb]
+        counts = np.bincount(bside, minlength=4) if len(Xb) else np.zeros(4, int)
+        log(f"  outline points triangulated: top {counts[0]}, right {counts[1]}, "
+            f"bottom {counts[2]}, left {counts[3]} (of {len(out0)})")
+
+    # Height field, isometric unrolling, then scale/placement from the whole
+    # flattened outline (all reference outline points, intersected with the surface).
+    rect = None
     for it in range(2):
         log(f"height field + flattening (pass {it + 1}) ...")
-        gu, gv, Z, resid = fit_heightfield(uvz, W, H, args.grid, args.smooth)
+        data = np.r_[uvz, to_page(F, Xb)] if len(Xb) else uvz
+        gu, gv, Z, resid = fit_heightfield(data, bnd, args.grid, args.smooth)
         st, strain_med, strain_max = flatten_grid(gu, gv, Z)
-        Cs = ray_surface(K, quad, F, gu, gv, Z, c, n)
-        cuvz = to_page(F, Cs)
-        cst = np.stack([
-            cv2.remap(st[..., k].astype(np.float32),
-                      ((cuvz[:, 0] - gu[0]) / (gu[1] - gu[0])).astype(np.float32)[:, None],
-                      ((cuvz[:, 1] - gv[0]) / (gv[1] - gv[0])).astype(np.float32)[:, None],
-                      cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[:, 0] for k in range(2)], 1)
-        # corner order in the page frame: (0,0), (W,0), (W,H), (0,H)
-        order = [int(np.argmin(np.linalg.norm(cuvz[:, :2] - q, axis=1)))
-                 for q in ([0, 0], [W, 0], [W, H], [0, H])]
-        cst = cst[order]
-        short = 0.5 * (np.linalg.norm(cst[1] - cst[0]) + np.linalg.norm(cst[2] - cst[3]))
-        long_ = 0.5 * (np.linalg.norm(cst[3] - cst[0]) + np.linalg.norm(cst[2] - cst[1]))
-        k = 0.5 * (W / short + H / long_)
-        log(f"  flat outline {short:.2f} x {long_:.2f} mm -> rescale {k:.4f}")
+        Xo, hit = ray_surface(rays_of(out0, cam), F, gu, gv, Z, c, n)
+        uvo = to_page(F, Xo)
+        sto = sample_grid2(st, gu, gv, uvo[:, 0], uvo[:, 1])
+        use = hit & (side >= 0)
+        cidx = [int(np.argmin(np.linalg.norm(uvo[:, :2] - q_, axis=1))) for q_ in ([0, 0], [W, 0], [W, H], [0, H])]
+        x0 = corners_init(sto[cidx], W, H) if rect is None else rect
+        rect, xf, rres = fit_rectangle(sto[use], side[use], W, H, x0)
+        k = rect[0]
+        log(f"  outline fit: scale {k:.4f}, rms {np.sqrt(np.mean(rres ** 2)):.3f} mm "
+            f"({use.sum()} outline points)")
         if it == 0:
             F["scale"] *= k
-            o_uv = cuvz[order[0], :2] * k
-            F["o"] = from_page(F, np.array([o_uv[0], o_uv[1], 0.0]))
             uvz = to_page(F, X)
-    st, cst = align_flat(st, cst, W, H)
-    corner_err = np.linalg.norm(cst - [[0, 0], [W, 0], [W, H], [0, H]], axis=1)
-    log(f"  z range {uvz[:,2].min():.2f} .. {uvz[:,2].max():.2f} mm, "
-        f"point residual to surface (MAD) {1.4826*np.median(np.abs(resid)):.3f} mm")
-    log(f"  flattening strain median {strain_med*100:.3f} %, max {strain_max*100:.2f} %, "
-        f"corner fit {corner_err.max():.2f} mm")
-    sx = (uvz[:, 0] - gu[0]) / (gu[1] - gu[0])
-    sy = (uvz[:, 1] - gv[0]) / (gv[1] - gv[0])
-    pst = np.stack([cv2.remap(st[..., j].astype(np.float32), sx.astype(np.float32)[:, None],
-                              sy.astype(np.float32)[:, None], cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_REPLICATE)[:, 0] for j in range(2)], 1)
+            rect = rect.copy(); rect[0] = 1.0
+    st = xf(rect, st.reshape(-1, 2)).reshape(st.shape)
+    outline_rms = float(np.sqrt(np.mean(rres ** 2)))
+    pst = sample_grid2(st, gu, gv, uvz[:, 0], uvz[:, 1])
+    log(f"  z range {uvz[:, 2].min():.2f} .. {uvz[:, 2].max():.2f} mm, "
+        f"point residual to surface (MAD) {1.4826 * np.median(np.abs(resid)):.3f} mm, "
+        f"flattening strain median {strain_med * 100:.3f} %")
 
     # outputs
-    cols = img1[np.clip(p1[:, 1].astype(int), 0, h1 - 1), np.clip(p1[:, 0].astype(int), 0, w1 - 1)]
+    sf = s
+    cols = imgs[0][np.clip(obs[:, 0, 1].astype(int), 0, imgs[0].shape[0] - 1),
+                   np.clip(obs[:, 0, 0].astype(int), 0, imgs[0].shape[1] - 1)]
+    obs_full = obs / sf
+    hdr = "u_mm,v_mm,z_mm,s_mm,t_mm," + ",".join(f"x{j},y{j}" for j in range(V)) + ",reproj_px"
     np.savetxt(os.path.join(args.out, "points.csv"),
-               np.c_[uvz, pst, p1 / s1, p2 / s2, err],
-               delimiter=",", fmt="%.4f", header="u_mm,v_mm,z_mm,s_mm,t_mm,x1,y1,x2,y2,reproj_px", comments="")
+               np.c_[uvz, pst, obs_full.reshape(len(obs), -1), np.nanmax(err, 1)],
+               delimiter=",", fmt="%.4f", header=hdr, comments="")
+    if len(Xb):
+        np.savetxt(os.path.join(args.out, "outline.csv"), to_page(F, Xb), delimiter=",", fmt="%.4f",
+                   header="u_mm,v_mm,z_mm", comments="")
     write_ply(os.path.join(args.out, "points.ply"), uvz, cols)
     np.savez(os.path.join(args.out, "heightfield.npz"), u=gu, v=gv, z=Z, st=st,
-             K=K, R=R, t=t, origin=F["o"], eu=F["eu"], ev=F["ev"], en=F["en"],
-             scale=F["scale"], proc_scale=s1)
-    save_heightmap_png(os.path.join(args.out, "heightfield.png"), gu, gv, Z, uvz, W, H)
+             f=cam["f"] / sf, k1=cam["k1"], k2=cam["k2"], R=np.array(Rs), t=np.array(ts),
+             origin=F["o"], eu=F["eu"], ev=F["ev"], en=F["en"], scale=F["scale"])
+    allpts = np.r_[uvz, to_page(F, Xb)] if len(Xb) else uvz
+    save_heightmap_png(os.path.join(args.out, "heightfield.png"), gu, gv, Z, allpts, W, H)
 
-    dbg = img1.copy()
+    dbg = imgs[0].copy()
     zl = np.percentile(np.abs(uvz[:, 2]), 99) + 1e-6
     zc = np.clip((uvz[:, 2] / zl + 1) * 127.5, 0, 255).astype(np.uint8)
     cm = cv2.applyColorMap(zc.reshape(-1, 1), cv2.COLORMAP_JET).reshape(-1, 3)
-    for (x, y), cc in zip(p1.astype(int), cm):
+    for (x, y), cc in zip(obs[:, 0].astype(int), cm):
         cv2.circle(dbg, (x, y), 2, tuple(int(v) for v in cc), -1)
-    cv2.polylines(dbg, [quad.astype(np.int32)], True, (0, 255, 0), 3)
+    cv2.polylines(dbg, [out0.astype(np.int32)], True, (0, 255, 0), 2)
     cv2.imwrite(os.path.join(args.out, "overlay.jpg"), dbg, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
-    Kfull = K.copy(); Kfull[:2] /= s1
+    camf = dict(cam, f=cam["f"] / sf, cx=(cam["cx"] + 0.5) / sf - 0.5, cy=(cam["cy"] + 0.5) / sf - 0.5)
     inv = flat_to_uv(st, gu, gv, W, H)
-    flat = render_flat(full1, Kfull, dist, F, gu, gv, Z, W, H, args.dpi, inv=inv)
+    flat = render_flat(full0, camf, F, gu, gv, Z, W, H, args.dpi, inv)
     cv2.imwrite(os.path.join(args.out, "flat.png"), flat)
 
-    report = dict(points=int(len(X)), focal_px=float(Kfull[0, 0]), focal_source=ksrc,
-                  reproj_rms_px=float(np.sqrt(np.mean(err ** 2))),
-                  triangulation_angle_median_deg=float(np.median(ang)),
-                  baseline_mm=float(np.linalg.norm(cam2) * F["scale"]),
+    report = dict(views=V, points=int(len(X)), outline_points=int(len(Xb)),
+                  focal_px=float(camf["f"]), focal_source=ksrc, k1=cam["k1"], k2=cam["k2"],
+                  reproj_rms_px=float(rms), triangulation_angle_median_deg=ang_med,
                   distance_mm=float(np.median(X[:, 2]) * F["scale"]),
-                  page_measured_mm=[float(v) for v in F["measured_mm"]],
+                  baselines_mm=[float(np.linalg.norm(cc) * F["scale"]) for cc in cams_c[1:]],
                   z_min_mm=float(uvz[:, 2].min()), z_max_mm=float(uvz[:, 2].max()),
                   surface_residual_mad_mm=float(1.4826 * np.median(np.abs(resid))),
                   flatten_strain_median=strain_med, flatten_strain_max=strain_max,
-                  corner_fit_max_mm=float(corner_err.max()))
-    with open(os.path.join(args.out, "report.json"), "w") as f:
-        json.dump(report, f, indent=2)
+                  outline_fit_rms_mm=outline_rms)
+    with open(os.path.join(args.out, "report.json"), "w") as fh:
+        json.dump(report, fh, indent=2)
     log(f"done -> {args.out}/")
 
 
