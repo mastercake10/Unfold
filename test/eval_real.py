@@ -27,7 +27,7 @@ def homography_flat(photo, W, H, dpi):
     return cv2.warpPerspective(img, M, (ow, oh), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
 
 
-def compare(flat, scan, scan_dpi, page_w_mm, vis_path=None, max_err_mm=6.0):
+def compare(flat, scan, scan_dpi, page_w_mm, vis_path=None, max_err_mm=6.0, return_transform=False):
     mm_per_px = page_w_mm / flat.shape[1]
     s = (25.4 / scan_dpi) / mm_per_px
     scan = cv2.resize(scan, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
@@ -67,6 +67,8 @@ def compare(flat, scan, scan_dpi, page_w_mm, vis_path=None, max_err_mm=6.0):
                rotation_deg=float(np.degrees(np.arctan2(M[1, 0], M[0, 0]))),
                local_median_mm=float(np.median(r)), local_p95_mm=float(np.percentile(r, 95)),
                local_max_mm=float(r.max()), bands=bands)
+    if return_transform:
+        return res, M, scan
     if vis_path:
         vis = cv2.cvtColor(cv2.cvtColor(flat, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR) // 2 + 127
         lim = 0.5

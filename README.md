@@ -5,7 +5,7 @@
 ```
 pip install opencv-python numpy scipy pillow matplotlib
 python3 docscan3d.py ref.jpg right.jpg up.jpg down.jpg -o out   # recommended: 4 views
-python3 docscan3d.py ref.jpg right.jpg -o out --focal-px 3030 --fixed-focal   # 2 views need a known focal
+python3 docscan3d.py ref.jpg right.jpg -o out --focal-px 3030   # 2 views: focal is kept fixed, pass it
 ```
 
 The first image is the reference that gets rendered. With 4 views the focal length is self-calibrated
@@ -39,9 +39,23 @@ The first image is the reference that gets rendered. With 4 views the focal leng
 | `points.ply` | same points in page frame, colored |
 | `heightfield.npz` | grid `u`, `v`, `z`, unrolled grid `st`, camera `K`, `R`, `t`, page frame |
 | `heightfield.png` | fitted height map + measured points |
-| `flat.png` | flattened page at `--dpi` (default 200) |
+| `flat.png` | flattened page at `--dpi` (default 200), shading removed |
+| `flat_raw.png` | same, original illumination |
 | `overlay.jpg` | view 1 with detected page and points colored by height |
 | `report.json` | point count, reprojection error, baseline, distance, strain, ... |
+
+## Output
+
+`flat.png` is the flattened page with the illumination divided out: the paper is modelled as
+a smooth function of position and of the measured surface normal (fold shading), fitted to
+the paper level (ink is darker and gets down-weighted), so printed grey areas stay grey.
+`flat_raw.png` is the same geometry with the original lighting. `--fuse` blends all views
+(meant for glare or a phone shadow in single shots); on the test samples it gave no image
+gain and slightly worse geometry, so it is off by default.
+
+Paper non-uniformity vs. the raw render (`test/eval_photo.py`, on scan-defined paper areas):
+sample 1 10.6 % → 3.0 %, 2 8.2 % → 5.5 % (rest is show-through from the printed back side),
+4 6.4 % → 2.3 %, 5 7.0 % → 1.4 %; edge sharpness unchanged.
 
 ## Real-photo results (Pixel 8, 5 folded letters, vs. flatbed scan)
 
@@ -75,5 +89,4 @@ Results (3000×4000 px, ~380 mm distance, folds 9° / −7°, curl + bent corner
   `np.savez("calib.npz", K=K, dist=dist, size=(w, h))` with `K, dist` from `cv2.calibrateCamera`.
 - Blank areas have no matches; the height field interpolates there. Page corners usually lie in such areas, which is where the remaining ~0.5 mm global offset comes from.
 - Height field regularization rounds sharp creases a bit; a finer `--grid` with a lower `--smooth` keeps them sharper if the point density allows.
-- Only view 1 is rendered. Fusing both views (glare removal, sharpness) is the obvious next step, as is a third view and the photometric refinement.
 - Page detection needs a page brighter than its background; no segmentation network yet.

@@ -688,8 +688,10 @@ def save_heightmap_png(path, gu, gv, Z, uvz, W, H):
     plt.close(fig)
 
 
-def render_flat(img, cam, F, gu, gv, Z, W, H, dpi, inv, R=None, t=None):
-    """Output pixel (s, t) -> surface point (u, v, z(u, v)) -> pixel in the photo."""
+# ---------------------------------------------------------------- photometric
+
+def flat_geometry(cam, F, gu, gv, Z, W, H, dpi, inv):
+    """For every output pixel: 3D point (reference frame), page-frame normal, page mask."""
     ppm = dpi / 25.4
     ow, oh = int(round(W * ppm)), int(round(H * ppm))
     u_r, v_r, res_mm = inv
@@ -698,16 +700,144 @@ def render_flat(img, cam, F, gu, gv, Z, W, H, dpi, inv, R=None, t=None):
     MX, MY = np.meshgrid(sx, sy)
     U = cv2.remap(u_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     V = cv2.remap(v_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    bad = ~np.isfinite(U) | ~np.isfinite(V)
-    U[bad], V[bad] = -1e4, -1e4
+    page = np.isfinite(U) & np.isfinite(V)
+    U[~page], V[~page] = -1e4, -1e4
     Zs = sample_heightfield(gu, gv, Z, U.ravel(), V.ravel())
     X = from_page(F, np.c_[U.ravel(), V.ravel(), Zs])
-    R = np.eye(3) if R is None else R
-    t = np.zeros(3) if t is None else t
-    px, _ = project(X, R, t, cam)
+    step = gu[1] - gu[0]
+    zv, zu = np.gradient(Z, step)
+    nu = -sample_heightfield(gu, gv, zu, U.ravel(), V.ravel()).reshape(oh, ow)
+    nv = -sample_heightfield(gu, gv, zv, U.ravel(), V.ravel()).reshape(oh, ow)
+    return X, (oh, ow), nu, nv, page
+
+
+def render_view(img, X, shape, cam, R, t):
+    oh, ow = shape
+    px, z = project(X, R, t, cam)
     mx = px[:, 0].reshape(oh, ow).astype(np.float32)
     my = px[:, 1].reshape(oh, ow).astype(np.float32)
-    return cv2.remap(img, mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+    h, w = img.shape[:2]
+    valid = (z.reshape(oh, ow) > 0) & (mx >= 2) & (my >= 2) & (mx < w - 3) & (my < h - 3)
+    out = cv2.remap(img, mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+    # detail captured per output pixel: photo pixels per output pixel (area ratio)
+    gxx, gxy = np.gradient(mx, axis=1), np.gradient(mx, axis=0)
+    gyx, gyy = np.gradient(my, axis=1), np.gradient(my, axis=0)
+    mag = np.abs(gxx * gyy - gxy * gyx)
+    return out, valid, mag
+
+
+def remove_shading(img, valid, nu, nv, sub=4):
+    """Divide out illumination. log-luminance of the paper is modelled as a low-order
+    function of position and surface normal (fold shading), fitted to the upper
+    envelope (ink and printed areas are darker and get down-weighted), then a
+    medium-scale residual correction catches what the model misses."""
+    oh, ow = valid.shape
+    L = np.log(np.clip(img.mean(2), 1.0, None))
+    ys, xs = np.mgrid[0:oh:sub, 0:ow:sub]
+    m = valid[ys, xs]
+    ys, xs = ys[m], xs[m]
+    s = xs / ow * 2 - 1
+    t = ys / oh * 2 - 1
+    a, b = nu[ys, xs], nv[ys, xs]
+
+    def feats(s, t, a, b):
+        return np.stack([np.ones_like(s), s, t, s * s, s * t, t * t, s ** 3, s * s * t, s * t * t, t ** 3,
+                         a, b, a * a, b * b, a * b], -1)
+
+    Phi = feats(s, t, a, b)
+    y = L[ys, xs]
+    w = np.ones(len(y))
+    beta = np.zeros(Phi.shape[1])
+    for it in range(12):
+        sw = np.sqrt(w)
+        beta = np.linalg.lstsq(Phi * sw[:, None], y * sw, rcond=None)[0]
+        r = y - Phi @ beta
+        scale_neg = 0.25 if it < 3 else 0.08  # start tolerant, then hug the paper level
+        w = np.where(r < 0, 1 / (1 + (r / scale_neg) ** 2), 1 / (1 + (r / 0.05) ** 2))
+
+    yy, xx = np.mgrid[0:oh, 0:ow]
+    S = np.empty((oh, ow), np.float32)
+    for r0 in range(0, oh, 256):  # chunked to keep memory flat
+        sl = slice(r0, min(r0 + 256, oh))
+        Pf = feats(xx[sl] / ow * 2 - 1, yy[sl] / oh * 2 - 1, nu[sl], nv[sl])
+        S[sl] = Pf @ beta
+
+    # residual correction on paper pixels (normalized convolution)
+    res = L - S
+    paper = valid & (res > -0.10) & (res < 0.10)
+    sig = max(oh, ow) / 200.0
+    num = cv2.GaussianBlur(np.where(paper, res, 0).astype(np.float32), (0, 0), sig)
+    den = cv2.GaussianBlur(paper.astype(np.float32), (0, 0), sig)
+    corr = np.where(den > 0.05, num / np.maximum(den, 1e-6), 0)
+    # wide fallback where paper evidence is sparse (inside large printed areas)
+    num2 = cv2.GaussianBlur(np.where(paper, res, 0).astype(np.float32), (0, 0), 6 * sig)
+    den2 = cv2.GaussianBlur(paper.astype(np.float32), (0, 0), 6 * sig)
+    corr2 = np.where(den2 > 1e-3, num2 / np.maximum(den2, 1e-6), 0)
+    blend = np.clip((den - 0.05) / 0.25, 0, 1)
+    S = S + blend * corr + (1 - blend) * corr2
+
+    alb = img / np.exp(S)[..., None]
+    pw = valid & paper
+    gains = np.array([np.median(alb[..., c][pw]) for c in range(3)])
+    return alb / gains
+
+
+def fuse_views(albs, valids, mags, ref=0, cap=16, ref_bonus=3.0, power=4.0):
+    """Align every view to the reference with dense flow, then blend per pixel.
+    Weights: captured detail, local agreement with the reference (bad alignment
+    gets no say), outlier rejection against the per-pixel median (glare, local
+    shadows). The power makes it a soft best-view selection instead of an average,
+    which keeps edges sharp."""
+    V = len(albs)
+    g = [np.clip(a.mean(2) * 255, 0, 255).astype(np.uint8) for a in albs]
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    oh, ow = g[0].shape
+    gx, gy = np.meshgrid(np.arange(ow, dtype=np.float32), np.arange(oh, dtype=np.float32))
+    gr = g[ref].astype(np.float32)
+
+    def lncc(a, b, k=15):
+        a = a - cv2.blur(a, (k, k)); b = b - cv2.blur(b, (k, k))
+        va, vb = cv2.blur(a * a, (k, k)), cv2.blur(b * b, (k, k))
+        return cv2.blur(a * b, (k, k)) / np.sqrt(va * vb + 1e-3), np.minimum(va, vb)
+
+    aligned, vals, ws = [], [], []
+    for j in range(V):
+        a, v = albs[j], valids[j]
+        conf = np.ones((oh, ow), np.float32)
+        if j != ref:
+            flow = dis.calc(g[ref], g[j], None)
+            flow[np.linalg.norm(flow, axis=2) > cap] = 0
+            a = cv2.remap(a, gx + flow[..., 0], gy + flow[..., 1], cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            v = cv2.remap(v.astype(np.uint8), gx + flow[..., 0], gy + flow[..., 1], cv2.INTER_NEAREST) > 0
+            n, var = lncc(gr, a.mean(2).astype(np.float32) * 255)
+            conf = np.where(var > 20, np.clip((n - 0.6) / 0.3, 0, 1), 1.0).astype(np.float32)
+            conf = cv2.erode(conf, np.ones((7, 7), np.uint8))
+        edge = cv2.distanceTransform(v.astype(np.uint8), cv2.DIST_L2, 3)
+        w = np.clip(mags[j], 0, 9) * np.clip(edge / 40.0, 0, 1) * conf * (ref_bonus if j == ref else 1.0)
+        aligned.append(a); vals.append(v); ws.append(w)
+    G = np.stack([a.mean(2) for a in aligned])
+    med = np.nanmedian(np.where(np.stack(vals), G, np.nan), axis=0)
+    out = np.zeros_like(aligned[0])
+    wsum = np.zeros((oh, ow), np.float32)
+    for j in range(V):
+        w = ws[j] * vals[j] / (1 + ((G[j] - med) / 0.06) ** 2)
+        w = cv2.GaussianBlur(w.astype(np.float32), (0, 0), 1.5) ** power
+        out += aligned[j] * w[..., None]
+        wsum += w
+    fallback = wsum < 1e-12
+    out = out / np.maximum(wsum, 1e-12)[..., None]
+    out[fallback] = aligned[ref][fallback]
+    return out
+
+
+def to_uint8(alb, white=0.95):
+    """Paper to `white` (not 1.0: clipping the paper flattens the bright side of
+    every edge); near-neutral pixels made neutral, real colours kept."""
+    gray = alb.mean(2, keepdims=True)
+    chroma = alb - gray
+    sat = np.abs(chroma).max(2, keepdims=True)
+    keep = np.clip((sat - 0.03) / 0.05, 0, 1)
+    return np.clip((gray + chroma * keep) * 255 * white, 0, 255).astype(np.uint8)
 
 
 def match_ref(kp0, d0, g, mask, n_features):
@@ -783,6 +913,9 @@ def main():
     ap.add_argument("--dpi", type=int, default=200, help="dpi of the flattened output")
     ap.add_argument("--no-densify", action="store_true")
     ap.add_argument("--no-outline", action="store_true", help="do not triangulate the page outline")
+    ap.add_argument("--fuse", action="store_true",
+                    help="blend all views (against glare/shadows in single shots; may soften geometry slightly)")
+    ap.add_argument("--no-shading", action="store_true", help="keep the original illumination")
     ap.add_argument("--dense", type=int, default=40000, help="max candidate points for densification")
     args = ap.parse_args()
     if len(args.images) < 2:
@@ -808,7 +941,11 @@ def main():
         args.fixed_focal, n_dist = True, 0
     else:
         n_dist = args.distortion
-    full0 = imgs[0]
+    if V == 2 and not args.fixed_focal:
+        # two views do not determine the focal length; refining it only adds error
+        args.fixed_focal = True
+        log("2 views: focal length kept fixed (use --focal-px if EXIF is off, e.g. 16:9 crops)")
+    fulls = list(imgs)
     imgs = [cv2.resize(im, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else im for im in imgs]
     gs = [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in imgs]
     log(f"{V} views, focal start {cam['f'] / s:.1f} px ({ksrc})")
@@ -1011,8 +1148,20 @@ def main():
 
     camf = dict(cam, f=cam["f"] / sf, cx=(cam["cx"] + 0.5) / sf - 0.5, cy=(cam["cy"] + 0.5) / sf - 0.5)
     inv = flat_to_uv(st, gu, gv, W, H)
-    flat = render_flat(full0, camf, F, gu, gv, Z, W, H, args.dpi, inv)
-    cv2.imwrite(os.path.join(args.out, "flat.png"), flat)
+    log("rendering ...")
+    Xr, shape, nu_m, nv_m, page = flat_geometry(camf, F, gu, gv, Z, W, H, args.dpi, inv)
+    views = list(range(V)) if args.fuse else [0]
+    rend = [render_view(fulls[j], Xr, shape, camf, Rs[j], ts[j]) for j in views]
+    cv2.imwrite(os.path.join(args.out, "flat_raw.png"), np.clip(rend[0][0], 0, 255).astype(np.uint8))
+    if args.no_shading:
+        albs = [r[0] / 255.0 for r in rend]
+    else:
+        albs = [remove_shading(r[0], r[1] & page, nu_m, nv_m) for r in rend]
+    if len(views) > 1:
+        flat = fuse_views(albs, [r[1] & page for r in rend], [r[2] for r in rend])
+    else:
+        flat = albs[0]
+    cv2.imwrite(os.path.join(args.out, "flat.png"), to_uint8(flat))
 
     report = dict(views=V, points=int(len(X)), outline_points=int(len(Xb)),
                   focal_px=float(camf["f"]), focal_source=ksrc, k1=cam["k1"], k2=cam["k2"],
