@@ -619,57 +619,124 @@ std::vector<Pts2> detect_text_lines(const cv::Mat& g8_, double W_, double H_, bo
     const int px = std::max(1, (int)std::lround(1.0 / sc));  // pixels per mm
     cv::Mat ink, blob;
     cv::adaptiveThreshold(g8, ink, 255, cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY_INV, 15 * px | 1, 12);
-    // letters and words of one line merge, lines stay apart
-    cv::morphologyEx(ink, blob, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(4 * px, 1)));
-    cv::Mat lab, stats, cent;
-    int n = cv::connectedComponentsWithStats(blob, lab, stats, cent, 8, CV_32S);
-    std::vector<Pts2> lines;
-    for (int k = 1; k < n; k++) {
-        int x0 = stats.at<int>(k, cv::CC_STAT_LEFT), y0 = stats.at<int>(k, cv::CC_STAT_TOP);
-        int w = stats.at<int>(k, cv::CC_STAT_WIDTH), h = stats.at<int>(k, cv::CC_STAT_HEIGHT);
-        if (w * sc < 30 || h * sc > 7 || h * sc < 1) continue;
-        // ink centre per column bin
-        int nb = (int)(w * sc / bin);
-        Pts2 pts;
-        for (int b = 0; b < nb; b++) {
-            int xa = x0 + (int)(b * bin / sc), xb = std::min(x0 + w, x0 + (int)((b + 1) * bin / sc));
-            double sy = 0;
-            int cnt = 0;
-            for (int y = y0; y < y0 + h; y++) {
-                const int* l = lab.ptr<int>(y);
-                const uchar* q = ink.ptr<uchar>(y);
-                for (int x = xa; x < xb; x++)
-                    if (l[x] == k && q[x]) sy += y, cnt++;
-            }
-            if (cnt < 3 * px) continue;  // gap between words
-            Vec2 P((xa + xb) / 2.0 * sc, (sy / cnt + 0.5) * sc);
-            if (P.x() > border && P.x() < W - border && P.y() > border && P.y() < H - border) pts.push_back(P);
-        }
-        if (pts.size() < 8) continue;
-        // drop bins off a smooth curve (descenders, touching neighbours)
-        std::vector<char> ok(pts.size(), 1);
-        for (int pass = 0; pass < 2; pass++) {
-            std::vector<double> xs, ys;
-            for (size_t i = 0; i < pts.size(); i++)
-                if (ok[i]) xs.push_back(pts[i].x()), ys.push_back(pts[i].y());
-            if (xs.size() < 8) break;
-            auto cf = polyfit(xs, ys, 2);
-            for (size_t i = 0; i < pts.size(); i++) ok[i] = std::abs(pts[i].y() - polyval(cf, pts[i].x())) < 0.6;
-        }
-        Pts2 keep;
-        for (size_t i = 0; i < pts.size(); i++)
-            if (ok[i]) keep.push_back(pts[i]);
-        if (keep.size() < 8 || keep.back().x() - keep.front().x() < 30) continue;
-        double slope = (keep.back().y() - keep.front().y()) / (keep.back().x() - keep.front().x());
-        if (std::abs(slope) > 0.05) continue;
-        lines.push_back(keep);
+    {
+        // only clearly dark ink (not crease shadows or halftone areas): below 65 % of the local paper
+        cv::Mat bg, dark;
+        cv::dilate(g8, bg, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3 * px | 1, 3 * px | 1)));
+        cv::Mat g16, bg16;
+        g8.convertTo(g16, CV_16U, 100);
+        bg.convertTo(bg16, CV_16U, 65);
+        cv::compare(g16, bg16, dark, cv::CMP_LT);
+        ink &= dark;
+        // underlines and rules would pull the line centre down: remove long thin horizontal strokes
+        cv::Mat rule;
+        cv::morphologyEx(ink, rule, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(4 * px, 1)));
+        cv::dilate(rule, rule, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, 3)));
+        ink &= ~rule;
     }
+    // letters of one word merge, lines stay apart
+    cv::morphologyEx(ink, blob, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2 * px, 1)));
+    // per column bin: vertical runs of text, each with its ink centre
+    struct Run {
+        Vec2 P;
+        double h;
+        int next = -1, prev = -1;
+    };
+    const int nb = (int)(g8.cols * sc / bin);
+    std::vector<std::vector<Run>> runs(nb);
+    for (int b = 0; b < nb; b++) {
+        int xa = (int)(b * bin / sc), xb = std::min(g8.cols, (int)((b + 1) * bin / sc));
+        int y = 0;
+        auto covered = [&](int yy) { return cv::countNonZero(blob.row(yy).colRange(xa, xb)) * 3 >= (xb - xa); };
+        while (y < g8.rows) {
+            if (!covered(y)) {
+                y++;
+                continue;
+            }
+            int y0 = y;
+            while (y < g8.rows && covered(y)) y++;
+            double h = (y - y0) * sc;
+            if (h < 1.0 || h > 6.0) continue;
+            // median ink row: hardly moved by ascenders and descenders
+            std::vector<int> rc(y - y0);
+            int cnt = 0;
+            for (int yy = y0; yy < y; yy++) {
+                const uchar* q = ink.ptr<uchar>(yy);
+                for (int x = xa; x < xb; x++) rc[yy - y0] += q[x] != 0;
+                cnt += rc[yy - y0];
+            }
+            if (cnt < 3 * px) continue;
+            double ym = y0;
+            for (int k = 0, acc = 0; k < (int)rc.size(); k++) {
+                if (acc + rc[k] >= cnt / 2.0) {
+                    ym = y0 + k + (cnt / 2.0 - acc) / rc[k];
+                    break;
+                }
+                acc += rc[k];
+            }
+            Vec2 P((xa + xb) / 2.0 * sc, ym * sc);
+            if (P.x() > border && P.x() < W - border && P.y() > border && P.y() < H - border) runs[b].push_back({P, h});
+        }
+    }
+    // link runs of neighbouring bins (word gaps up to 1 empty bin), closest first
+    for (int gap = 1; gap <= 2; gap++) {
+        struct Cand {
+            double cost;
+            int b, i, j;
+        };
+        std::vector<Cand> cand;
+        for (int b = 0; b + gap < nb; b++)
+            for (int i = 0; i < (int)runs[b].size(); i++)
+                for (int j = 0; j < (int)runs[b + gap].size(); j++) {
+                    const Run &r = runs[b][i], &q = runs[b + gap][j];
+                    double dy = std::abs(q.P.y() - r.P.y());
+                    if (dy < 0.6 + 0.03 * bin * gap && std::max(r.h, q.h) < 1.7 * std::min(r.h, q.h))
+                        cand.push_back({dy, b, i, j});
+                }
+        std::sort(cand.begin(), cand.end(), [](const Cand& x, const Cand& y) { return x.cost < y.cost; });
+        for (auto& c : cand) {
+            Run &r = runs[c.b][c.i], &q = runs[c.b + gap][c.j];
+            if (r.next >= 0 || q.prev >= 0) continue;
+            r.next = (c.b + gap) * 4096 + c.j;
+            q.prev = c.b * 4096 + c.i;
+        }
+    }
+    std::vector<Pts2> lines;
+    for (int b = 0; b < nb; b++)
+        for (auto& r0 : runs[b]) {
+            if (r0.prev >= 0) continue;
+            Pts2 pts;
+            for (const Run* r = &r0;; r = &runs[r->next / 4096][r->next % 4096]) {
+                pts.push_back(r->P);
+                if (r->next < 0) break;
+            }
+            if (pts.size() < 8) continue;
+            // drop points off the local course (descenders, superscripts, touching neighbours)
+            std::vector<char> ok(pts.size(), 1);
+            for (int pass = 0; pass < 2; pass++) {
+                std::vector<char> nok(pts.size());
+                for (size_t i = 0; i < pts.size(); i++) {
+                    std::vector<double> ys;
+                    for (size_t k = 0; k < pts.size(); k++)
+                        if (ok[k] && std::abs(pts[k].x() - pts[i].x()) < 8.0) ys.push_back(pts[k].y());
+                    nok[i] = ys.size() >= 3 && std::abs(pts[i].y() - median(ys)) < 0.5;
+                }
+                ok = nok;
+            }
+            Pts2 keep;
+            for (size_t i = 0; i < pts.size(); i++)
+                if (ok[i]) keep.push_back(pts[i]);
+            if (keep.size() < 8 || keep.back().x() - keep.front().x() < 30) continue;
+            double slope = (keep.back().y() - keep.front().y()) / (keep.back().x() - keep.front().x());
+            if (std::abs(slope) > 0.05) continue;
+            lines.push_back(keep);
+        }
     return lines;
 }
 
 Disp fit_correction(double W, double H, const std::vector<EdgeTerm>& edges, const std::vector<Eigen::Vector4d>& segs,
                     const std::vector<char>& horiz, const Pts2& anchors, double w_anchor,
-                    const std::vector<Pts2>& curves, const std::vector<Pts2>& curves_v) {
+                    const std::vector<Pts2>& curves, const std::vector<Pts2>& curves_v, double w_text) {
     const double step = 4.0, lam = 30.0, w_edge = 1.0, w_line = 1.0;
     Disp D;
     D.step = step;
@@ -740,7 +807,7 @@ Disp fit_correction(double W, double H, const std::vector<EdgeTerm>& edges, cons
         // text lines: all points of one line get the same t (s for vertical lines)
         for (auto& cv : axis == 1 ? curves : curves_v) {
                 int n = (int)cv.size();
-                double w = w_line / std::sqrt(n / 10.0 + 1);
+                double w = w_text * w_line / std::sqrt(n / 10.0 + 1);
                 for (auto& P : cv) {
                     int c[5];
                     double v[5];

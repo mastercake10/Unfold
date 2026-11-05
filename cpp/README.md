@@ -20,8 +20,12 @@ One photo: there is no 3D measurement. The page is taken as the plane through it
 outline is pulled onto the A4 rectangle and printed lines and text lines are straightened. OCR
 reads it as well as 2 or 4 views (tesseract, 5 samples: 92-98 % of the scan's words in all three
 modes); geometry is about 2x less exact (median 0.18-0.48 mm vs 0.14-0.25 mm against the scans).
-Text lines (ink centre per 3 mm column of each line, also vertical ones for landscape pages)
-are used in every mode; `DOCSCAN_TEXTLINES=0` turns them off. The output is turned so the text
+Text lines are used in every mode; `DOCSCAN_TEXTLINES=0` turns them off. They are tracked per
+3 mm column (median row of dark ink, underlines removed) and linked across word gaps, so lines
+that kink at a crease are kept whole; vertical ones too for landscape pages. With one photo they
+weigh 8x more (nothing else measures the shape inside the page): on 4 one-photo samples compared
+with the source PDFs, text tilt went from 0.2-0.6 deg rms to 0.07-0.3 deg and tesseract finds
+96.6 % of the PDF's words (OCR of the PDF image itself: 97.2 %). The output is turned so the text
 is upright (text line direction, ascenders vs descenders); `--no-rotate` turns that off.
 
 Library API (`src/docscan.hpp`): `cv::Mat docscan::process(images, options)`; throws

@@ -819,7 +819,8 @@ cv::Mat Session::Impl::correct_render(Flat& fl) const {
                     for (auto& tl : *tv)
                         for (auto& P : tl) P -= dl(P);
             }
-            dl = fit_correction(W, H, hold, segs, hz, anchors, opt.anchor_w, text, text_v);
+            // without 3D content (one photo) text lines are the best evidence of the page shape
+            dl = fit_correction(W, H, hold, segs, hz, anchors, opt.anchor_w, text, text_v, anchors.empty() ? 8.0 : 1.0);
             if (text_lines) log(fmt("    text lines: %zu horizontal, %zu vertical", text.size(), text_v.size()));
             have = true;
             std::vector<double> dd;
