@@ -646,6 +646,27 @@ def fit_rectangle(st, side, W, H, x0):
     return res.x, xf, r
 
 
+def local_line(a, r, ok, q, half=10.0, k_min=8):
+    """Value at each q of a straight line fitted to the ok samples (a, r) within +-half
+    of q (at least the k_min nearest ones)."""
+    a, r = a[ok], r[ok]
+    out = np.zeros(len(q))
+    if len(a) == 0:
+        return out
+    for i, x in enumerate(q):
+        d = np.abs(a - x)
+        m = d <= half
+        if m.sum() < k_min:
+            m = d <= np.sort(d)[min(k_min, len(d)) - 1]
+        aa, rr = a[m], r[m]
+        if np.ptp(aa) < 1.0:
+            out[i] = np.mean(rr)
+        else:
+            cf = np.polyfit(aa - x, rr, 1)
+            out[i] = cf[1]
+    return out
+
+
 def detect_lines(flat_gray, W, H, min_mm=8.0, max_dev_deg=3.0, border_mm=4.0):
     """Near-axis line segments in a flat render, in flat mm: (segments, is_horizontal)."""
     oh, ow = flat_gray.shape
@@ -1422,6 +1443,10 @@ def main():
             # Outline points must agree with their neighbours along the edge: a smooth
             # offset of a whole edge is real (extrapolated margin) and gets corrected,
             # isolated jumps are detection errors (shadows, background) and are dropped.
+            # Exception: an extrapolated page end can turn fast (5-8 mm over the last 30 mm,
+            # no measured data there). Points at the ends of an edge that the whole-edge fit
+            # rejects are restored if they agree with their local neighbours. Bumps in the
+            # middle (fold creases) stay rejected.
             edge_fit = {}
             for sd, ax, tg in ((3, 0, 0.0), (1, 0, W), (0, 1, 0.0), (2, 1, H)):
                 m = use & (side == sd)
@@ -1436,20 +1461,32 @@ def main():
                     dev = r - np.polyval(cf, along)
                     mad = 1.4826 * np.median(np.abs(dev[ok])) + 1e-6
                     ok = (np.abs(r) < 25.0) & (np.abs(dev) < max(1.0, 4 * mad))
-                edge_fit[sd] = (ax, cf)
+                ok_l = np.abs(r) < 25.0
+                for _ in range(3):
+                    dev = r - local_line(along, r, ok_l, along)
+                    mad = 1.4826 * np.median(np.abs(dev[ok_l])) + 1e-6
+                    ok_l = (np.abs(r) < 25.0) & (np.abs(dev) < max(1.0, 4 * mad))
+                o = np.argsort(along)
+                kept = np.nonzero(ok[o])[0]
+                if len(kept):
+                    ends = np.zeros(len(o), bool)
+                    ends[:kept[0]] = True
+                    ends[kept[-1] + 1:] = True
+                    ok[o[ends & ok_l[o]]] = True
+                edge_fit[sd] = (ax, along[ok], r[ok])
                 edges.append((P_[ok], ax, tg))
                 if os.environ.get("BA_DEBUG"):
                     np.savez(os.path.join(args.out, f"dbg_edge{sd}.npz"), img=out0[m], uvo=uvo[m], st=P_, r=r, ok=ok)
                 log(f"    edge {('top', 'right', 'bottom', 'left')[sd]}: offset median {np.median(r):+.2f} mm, "
                     f"range {np.percentile(r, 5):+.2f}..{np.percentile(r, 95):+.2f}, kept {ok.sum()}/{len(r)}")
-            # corners: keep only if consistent with both adjacent edge fits
+            # corners: keep only if consistent with the trend of the adjacent edge near them
             Pc, Tc = sto_f[cidx], ctarget
             for ax in (0, 1):
                 keepc = okc.copy()
                 for k in range(4):
-                    for sd, (eax, cf) in edge_fit.items():
+                    for sd, (eax, ea, er) in edge_fit.items():
                         if eax == ax and abs(Tc[k, ax] - (0.0 if sd in (3, 0) else (W if sd == 1 else H))) < 1e-6:
-                            pred = np.polyval(cf, Pc[k, 1 - ax])
+                            pred = local_line(ea, er, np.ones(len(ea), bool), Pc[k, 1 - ax:2 - ax], half=30.0)[0]
                             if abs((Tc[k, ax] - Pc[k, ax]) - pred) > 3.0:
                                 keepc[k] = False
                 edges.append((Pc[keepc], ax, Tc[keepc][:, ax]))
