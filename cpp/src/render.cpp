@@ -5,6 +5,9 @@
 #include <functional>
 
 #include "stages.hpp"
+#ifdef DOCSCAN_GPU
+#include "gpu_sift.hpp"
+#endif
 
 #include <chrono>
 
@@ -263,9 +266,49 @@ static bool paper_level(const cv::Mat& x, double& P, double& s) {
     return true;
 }
 
+// cv::fastNlMeansDenoising(g8, gd, 4, 7, 21) (a search window of 11 is 2.5x faster but loses
+// umlaut dots). With a GPU, its top part runs there while the CPU does the rest; the split
+// follows the speeds measured last time. Each part gets 13 extra rows (search + patch radius),
+// so the seam is exact.
+static void denoise(const cv::Mat& g8, cv::Mat& gd, bool gpu) {
+#ifdef DOCSCAN_GPU
+    static double share = 0.5;  // of the rows for the GPU
+    GpuSift* G = gpu ? GpuSift::get() : nullptr;
+    const int H = g8.rows, r = 13;
+    if (G && H > 4 * r) {
+        int split = std::clamp((int)std::lround(H * share), 2 * r, H - 2 * r);
+        cv::Mat top = g8.rowRange(0, split + r).clone(), bot = g8.rowRange(split - r, H).clone(), dt, db;
+        bool ok = false;
+        double tg = 0, tc = 0;
+        {
+            Thread th([&] {
+                auto t = std::chrono::steady_clock::now();
+                ok = G->denoise(top, dt, 4.0f);
+                tg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+            });
+            auto t = std::chrono::steady_clock::now();
+            cv::fastNlMeansDenoising(bot, db, 4.0f, 7, 21);
+            tc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+        }
+        if (ok) {
+            gd.create(g8.size(), CV_8U);
+            dt.rowRange(0, split).copyTo(gd.rowRange(0, split));
+            db.rowRange(r, db.rows).copyTo(gd.rowRange(split, H));
+            double rg = split / std::max(tg, 1e-3), rc = (H - split) / std::max(tc, 1e-3);
+            log(fmt("    denoising: GPU %d rows %.2f s, CPU %d rows %.2f s", split, tg, H - split, tc));
+            share = std::clamp(rg / (rg + rc), 0.05, 0.95);
+            return;
+        }
+    }
+#else
+    (void)gpu;
+#endif
+    cv::fastNlMeansDenoising(g8, gd, 4.0f, 7, 21);
+}
+
 // Scanner-like paper: denoise, even out small paper-level variations, push the paper to
 // white with a ramp. Pages without real colour come back single-channel.
-cv::Mat clean_paper(const cv::Mat& img) {
+cv::Mat clean_paper(const cv::Mat& img, bool gpu) {
     const double near = 0.10;
     int oh = img.rows, ow = img.cols;
     cv::Mat gray(oh, ow, CV_32F), colmask(oh, ow, CV_8U), g8(oh, ow, CV_8U);
@@ -284,7 +327,7 @@ cv::Mat clean_paper(const cv::Mat& img) {
     bool colour = cv::mean(colmask)[0] > 1e-3;
     cv::Mat gd, g;
     auto t = std::chrono::steady_clock::now();
-    cv::fastNlMeansDenoising(g8, gd, 4.0f, 7, 11);  // search 11 instead of 21: 2.5x faster, mean change 0.1 levels
+    denoise(g8, gd, gpu);
     log(fmt("    denoising %.2f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count()));
     gd.convertTo(g, CV_32F);
     double P0, s0;

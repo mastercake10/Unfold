@@ -22,6 +22,9 @@ public:
     bool detect(const cv::Mat& g, float contrast, const std::function<bool(const cv::Point2f&)>& keep,
                 std::vector<cv::KeyPoint>& kps, cv::Mat& desc);
 
+    // Non-local means like cv::fastNlMeansDenoising(g, out, h, 7, 21) (float weights).
+    bool denoise(const cv::Mat& g, cv::Mat& out, float h);
+
     const std::string& name() const;
 
     // GPU time (s) of the passes since the last call (0 if the device has no timestamps)

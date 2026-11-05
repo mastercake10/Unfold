@@ -38,6 +38,9 @@ const uint32_t kOrient[] = {
 const uint32_t kDescr[] = {
 #include "descriptor.spv.inc"
 };
+const uint32_t kNlm[] = {
+#include "nlm.spv.inc"
+};
 
 constexpr int kLayers = 3;
 constexpr double kSigma = 1.6;
@@ -66,6 +69,7 @@ struct PcBlur { int w, h, k, r; };
 struct PcDown { int sw, dw, dh; };
 struct PcExt { int o, w, h; float contrast, edge; };
 struct PcOct { int a, w, h; };
+struct PcNlm { int w, h; float k; int y0; };
 
 // OpenCV's getGaussianKernel(n, sigma, CV_32F) with n = cvRound(sigma*8+1)|1 (float images)
 std::vector<float> gauss_kernel(double sigma) {
@@ -101,7 +105,8 @@ struct GpuSift::Impl {
     VkDescriptorSet sets[kMaxOct] = {};  // one per octave
     VkPipeline p_bh[6] = {}, p_bv[6] = {};  // blur level l -> scratch, scratch -> level l
     VkPipeline p_up = VK_NULL_HANDLE, p_down = VK_NULL_HANDLE, p_ext = VK_NULL_HANDLE,
-               p_prep = VK_NULL_HANDLE, p_orient = VK_NULL_HANDLE, p_descr = VK_NULL_HANDLE;
+               p_prep = VK_NULL_HANDLE, p_orient = VK_NULL_HANDLE, p_descr = VK_NULL_HANDLE,
+               p_nlm = VK_NULL_HANDLE;
     Buf pyr, io, dsc;  // pyramid levels + scratch (device), small buffers, descriptors
     std::string name;
     std::mutex mu;
@@ -214,6 +219,7 @@ struct GpuSift::Impl {
         p_prep = pipeline(kPrep, sizeof kPrep);
         p_orient = pipeline(kOrient, sizeof kOrient);
         p_descr = pipeline(kDescr, sizeof kDescr);
+        p_nlm = pipeline(kNlm, sizeof kNlm);
 
         if (ts_period > 0) {
             VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
@@ -395,6 +401,28 @@ struct GpuSift::Impl {
         barrier();
     }
 
+    void nlm(const cv::Mat& g, float h, cv::Mat& out) {
+        const int w = g.cols, H = g.rows;
+        ensure(io, (kSrc << 2) + (size_t)w * H + 4, true);
+        ensure(dsc, (size_t)w * H * 4, true);
+        // set 0 needs all bindings; the levels are unused here
+        Range dummy{0, std::min<VkDeviceSize>(pyr.size, 1 << 16)};
+        Range lv[kLayers + 3];
+        for (auto& r : lv) r = dummy;
+        bind_octave(0, lv, dummy, dummy);
+        std::memcpy((uint8_t*)io.map + (kSrc << 2), g.data, (size_t)w * H);
+        begin();
+        use_octave(0);
+        // bands of rows: short GPU jobs (phone drivers may stop long ones)
+        const float k = (float)(1.4426950408889634 / (h * h * 49.0));
+        for (int y0 = 0; y0 < H; y0 += 128)
+            dispatch(p_nlm, PcNlm{w, H, k, y0}, (uint32_t)((w + 15) / 16), (uint32_t)((std::min(128, H - y0) + 15) / 16));
+        submit();
+        out.create(H, w, CV_8U);
+        const float* f = (const float*)dsc.map;
+        for (int i = 0; i < w * H; i++) out.data[i] = cv::saturate_cast<uchar>(f[i]);
+    }
+
     void run(const cv::Mat& g, float contrast, const std::function<bool(const cv::Point2f&)>& keep,
              std::vector<cv::KeyPoint>& kps, cv::Mat& dsc_out) {
         const int w = g.cols, h = g.rows, W = 2 * w, H = 2 * h;
@@ -551,7 +579,7 @@ struct GpuSift::Impl {
             for (Buf* b : {&pyr, &io, &dsc}) free(*b);
             for (VkPipeline p : p_bh) vkDestroyPipeline(dev, p, nullptr);
             for (VkPipeline p : p_bv) vkDestroyPipeline(dev, p, nullptr);
-            for (VkPipeline p : {p_up, p_down, p_ext, p_prep, p_orient, p_descr})
+            for (VkPipeline p : {p_up, p_down, p_ext, p_prep, p_orient, p_descr, p_nlm})
                 if (p) vkDestroyPipeline(dev, p, nullptr);
             if (qpool) vkDestroyQueryPool(dev, qpool, nullptr);
             if (dpool) vkDestroyDescriptorPool(dev, dpool, nullptr);
@@ -593,6 +621,18 @@ GpuSift* GpuSift::get() {
         }
     });
     return inst.get();
+}
+
+bool GpuSift::denoise(const cv::Mat& g, cv::Mat& out, float h) {
+    CV_Assert(g.type() == CV_8U && g.isContinuous());
+    std::lock_guard<std::mutex> lk(p->mu);
+    try {
+        p->nlm(g, h, out);
+        return true;
+    } catch (const std::exception& e) {
+        log(std::string("GPU denoising failed: ") + e.what());
+        return false;
+    }
 }
 
 bool GpuSift::detect(const cv::Mat& g, float contrast, const std::function<bool(const cv::Point2f&)>& keep,

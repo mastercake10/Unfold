@@ -1,6 +1,6 @@
-# Compiles the GPU SIFT shaders (src/shaders/*.comp) to SPIR-V included by gpu_sift.cpp.
+# Compiles the GPU shaders (src/shaders/*.comp) to SPIR-V included by gpu_sift.cpp.
 set(DOCSCAN_SHADER_DIR ${CMAKE_CURRENT_LIST_DIR}/src/shaders)
-set(DOCSCAN_SHADERS upscale blur downsample extrema prep_indirect orientation descriptor)
+set(DOCSCAN_SHADERS upscale blur downsample extrema prep_indirect orientation descriptor nlm)
 
 function(docscan_add_shaders target glslc)
   set(out_dir ${CMAKE_CURRENT_BINARY_DIR}/spv)

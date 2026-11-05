@@ -842,7 +842,7 @@ cv::Mat Session::Impl::correct_render(Flat& fl) const {
     cv::Mat valid = R.valid & R.page;
     cv::Mat alb = remove_shading(R.img, valid, R.nu, R.nv);
     double t_shading = secs(t);
-    cv::Mat out = clean_paper(to_uint8(alb));
+    cv::Mat out = clean_paper(to_uint8(alb), opt.gpu);
     double t_paper = secs(t);
     if (opt.rotate) {
         std::string info;

@@ -1,0 +1,61 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Non-local means (as cv::fastNlMeansDenoising: 7x7 patches, 21x21 search, BORDER_REFLECT_101,
+// weights below 0.001 dropped), in float. 8-bit input at IO[SRC], float output in DSC.
+// One workgroup per 16x16 pixels: for every search offset, squared differences of the tile
+// plus patch halo, then the 7x7 patch sums as two passes of 7-sums, all in shared memory.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+layout(push_constant) uniform PC { int w, h; float k; int y0; } pc;  // k = log2(e) / (h^2 * 49)
+
+const int SR = 10, TR = 3, T = 16;
+const int A = T + 2 * (SR + TR);  // tile, patch halo and search halo
+const int B = T + 2 * TR;         // tile and patch halo
+shared float img[A * A];
+shared float dsq[B * B];
+shared float hs[B * T];
+
+int refl(int p, int n) {
+    if (n == 1) return 0;
+    while (p < 0 || p >= n) {
+        if (p < 0) p = -p;
+        if (p >= n) p = 2 * n - 2 - p;
+    }
+    return p;
+}
+
+float src(int i) { return float((IO.v[SRC + (i >> 2)] >> (8 * (i & 3))) & 255u); }
+
+void main() {
+    int lx = int(gl_LocalInvocationID.x), ly = int(gl_LocalInvocationID.y), t = ly * T + lx;
+    int ox = int(gl_WorkGroupID.x) * T, oy = pc.y0 + int(gl_WorkGroupID.y) * T;
+    for (int i = t; i < A * A; i += 256) {
+        int x = refl(ox - SR - TR + i % A, pc.w), y = refl(oy - SR - TR + i / A, pc.h);
+        img[i] = src(y * pc.w + x);
+    }
+    barrier();
+    float sw = 0.0, swv = 0.0;
+    for (int dy = -SR; dy <= SR; dy++)
+        for (int dx = -SR; dx <= SR; dx++) {
+            for (int i = t; i < B * B; i += 256) {
+                int q = (i / B + SR) * A + i % B + SR;
+                float d = img[q] - img[q + dy * A + dx];
+                dsq[i] = d * d;
+            }
+            barrier();
+            for (int i = t; i < B * T; i += 256) {
+                int q = (i / T) * B + i % T;
+                hs[i] = dsq[q] + dsq[q + 1] + dsq[q + 2] + dsq[q + 3] + dsq[q + 4] + dsq[q + 5] + dsq[q + 6];
+            }
+            barrier();
+            float d = hs[ly * T + lx] + hs[(ly + 1) * T + lx] + hs[(ly + 2) * T + lx] + hs[(ly + 3) * T + lx] +
+                      hs[(ly + 4) * T + lx] + hs[(ly + 5) * T + lx] + hs[(ly + 6) * T + lx];
+            float wgt = exp2(-d * pc.k);
+            if (wgt < 0.001) wgt = 0.0;
+            sw += wgt;
+            swv += wgt * img[(ly + TR + SR + dy) * A + lx + TR + SR + dx];
+            barrier();
+        }
+    int x = ox + lx, y = oy + ly;
+    if (x < pc.w && y < pc.h) DSC.v[y * pc.w + x] = swv / sw;
+}
