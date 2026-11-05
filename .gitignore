@@ -1,0 +1,6 @@
+env/
+samples/
+test/out
+test/real
+test/synth
+__pycache__
