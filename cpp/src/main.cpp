@@ -62,7 +62,7 @@ static double exif_focal_35mm(const std::string& path) {
 static void usage() {
     std::fprintf(stderr,
                  "usage: docscan ref.jpg [view2.jpg [view3.jpg view4.jpg]] [-o OUT_DIR] [--focal-px F]\n"
-                 "               [--page WxH] [--dpi N] [--max-side PX] [--no-gpu]\n"
+                 "               [--page WxH] [--dpi N] [--max-side PX] [--features N] [--no-gpu]\n"
                  "  The first photo is the reference that gets rendered; 4 views recommended.\n"
                  "  With 2 views the focal length is kept fixed: pass --focal-px (Pixel 8 16:9: 3030).\n");
 }
@@ -88,6 +88,7 @@ int main(int argc, char** argv) {
         else if (a == "--focal-px") opt.focal_px = std::stod(next());
         else if (a == "--dpi") opt.dpi = std::stoi(next());
         else if (a == "--max-side") opt.max_side = std::stoi(next());
+        else if (a == "--features") opt.features = std::stoi(next());
         else if (a == "--no-gpu") opt.gpu = false;
         else if (a == "--page") {
             std::string v = next();

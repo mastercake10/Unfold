@@ -789,18 +789,22 @@ cv::Mat Session::Impl::correct_render(Flat& fl) const {
             std::vector<char> hz;
             cv::Mat g8 = gray_u8(R.img, R.page);
             detect_lines(g8, W, H, segs, hz);
-            std::vector<Pts2> text;
-            if (text_lines) text = detect_text_lines(g8, W, H);
+            std::vector<Pts2> text, text_v;
+            if (text_lines) {
+                text = detect_text_lines(g8, W, H);
+                text_v = detect_text_lines(g8, W, H, true);
+            }
             if (have) {
                 for (auto& sg : segs) {
                     Vec2 a = sg.head<2>(), b = sg.tail<2>();
                     sg << a - dl(a), b - dl(b);
                 }
-                for (auto& tl : text)
-                    for (auto& P : tl) P -= dl(P);
+                for (auto* tv : {&text, &text_v})
+                    for (auto& tl : *tv)
+                        for (auto& P : tl) P -= dl(P);
             }
-            dl = fit_correction(W, H, hold, segs, hz, anchors, opt.anchor_w, text);
-            if (text_lines) log(fmt("    %zu text lines", text.size()));
+            dl = fit_correction(W, H, hold, segs, hz, anchors, opt.anchor_w, text, text_v);
+            if (text_lines) log(fmt("    text lines: %zu horizontal, %zu vertical", text.size(), text_v.size()));
             have = true;
             std::vector<double> dd;
             for (size_t i = 0; i < st.size(); i++) {

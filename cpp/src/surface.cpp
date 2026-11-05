@@ -606,7 +606,15 @@ Vec2 Disp::operator()(const Vec2& q) const {
 //   lines:   all samples of a segment share one cross-axis coordinate (left free)
 //   anchors: points that should stay put
 // plus second-difference smoothness.
-std::vector<Pts2> detect_text_lines(const cv::Mat& g8, double W, double H) {
+std::vector<Pts2> detect_text_lines(const cv::Mat& g8_, double W_, double H_, bool vertical) {
+    if (vertical) {
+        auto lines = detect_text_lines(g8_.t(), H_, W_, false);
+        for (auto& l : lines)
+            for (auto& p : l) p = Vec2(p.y(), p.x());
+        return lines;
+    }
+    const cv::Mat& g8 = g8_;
+    const double W = W_, H = H_;
     const double sc = W / g8.cols, bin = 3.0, border = 4.0;
     const int px = std::max(1, (int)std::lround(1.0 / sc));  // pixels per mm
     cv::Mat ink, blob;
@@ -661,7 +669,7 @@ std::vector<Pts2> detect_text_lines(const cv::Mat& g8, double W, double H) {
 
 Disp fit_correction(double W, double H, const std::vector<EdgeTerm>& edges, const std::vector<Eigen::Vector4d>& segs,
                     const std::vector<char>& horiz, const Pts2& anchors, double w_anchor,
-                    const std::vector<Pts2>& curves) {
+                    const std::vector<Pts2>& curves, const std::vector<Pts2>& curves_v) {
     const double step = 4.0, lam = 30.0, w_edge = 1.0, w_line = 1.0;
     Disp D;
     D.step = step;
@@ -729,9 +737,8 @@ Disp fit_correction(double W, double H, const std::vector<EdgeTerm>& edges, cons
             }
             n_c++;
         }
-        // text lines: all points of one line get the same t
-        if (axis == 1)
-            for (auto& cv : curves) {
+        // text lines: all points of one line get the same t (s for vertical lines)
+        for (auto& cv : axis == 1 ? curves : curves_v) {
                 int n = (int)cv.size();
                 double w = w_line / std::sqrt(n / 10.0 + 1);
                 for (auto& P : cv) {
@@ -740,7 +747,7 @@ Disp fit_correction(double W, double H, const std::vector<EdgeTerm>& edges, cons
                     bil(P, c, v);
                     c[4] = N + n_c;
                     v[4] = -1;
-                    add_row(c, v, 5, w, -P[1]);
+                    add_row(c, v, 5, w, -P[axis]);
                 }
                 n_c++;
             }
