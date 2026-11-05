@@ -405,20 +405,38 @@ cv::Mat clean_paper(const cv::Mat& img, bool gpu, bool doc_tone) {
     paper_level(e, P, s);
     s = std::max(s, 2.0);
     double lo = P - 4 * s - 4, hi = P - s;
-    cv::Mat out(oh, ow, colour ? CV_8UC3 : CV_8U);
+    cv::Mat Y(oh, ow, CV_32F);
     parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
         for (int y = rg.start; y < rg.end; y++)
             for (int x = 0; x < ow; x++) {
                 double v = e.at<float>(y, x);
                 double yv = v <= lo ? v : lo + (v - lo) * (255 - lo) / std::max(hi - lo, 1e-3);
-                yv = std::clamp(yv, 0.0, 255.0);
-                if (doc_tone) {
-                    // ink to black, light grey (blur halos, leftover shading) to white, like
-                    // scanner apps. Tesseract's layout analysis (psm 3) drops other blocks then:
-                    // +5 % words on some pages, -3..-9 % on pages with light grey text
-                    double tc = std::clamp((yv - 40.0) / (245.0 - 40.0), 0.0, 1.0);
-                    yv = 255.0 * tc * tc * (3 - 2 * tc);
+                Y.at<float>(y, x) = (float)std::clamp(yv, 0.0, 255.0);
+            }
+    });
+    if (doc_tone) {
+        // Scanner-app look: black ink on white paper. The black point follows the darkest ink
+        // within ~3 mm, so thin or small print that the camera blurs to grey is darkened, not
+        // faded (a global curve lost 10 % of the words in a form's fine print).
+        const double ppm = std::min(ow, oh) / 210.0;
+        cv::Mat blk;
+        int k = (int)(3 * ppm) | 1;
+        cv::erode(Y, blk, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k, k)));
+        by_strips(blk, blk, (int)(5 * ppm), [&](const cv::Mat& a, cv::Mat& b) { cv::GaussianBlur(a, b, cv::Size(0, 0), 1.5 * ppm); });
+        parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+            for (int y = rg.start; y < rg.end; y++)
+                for (int x = 0; x < ow; x++) {
+                    double b0 = std::clamp((double)blk.at<float>(y, x), 40.0, 150.0);
+                    double tc = std::clamp((Y.at<float>(y, x) - b0) / (245.0 - b0), 0.0, 1.0);
+                    Y.at<float>(y, x) = (float)(255.0 * tc * tc * (3 - 2 * tc));
                 }
+        });
+    }
+    cv::Mat out(oh, ow, colour ? CV_8UC3 : CV_8U);
+    parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; y++)
+            for (int x = 0; x < ow; x++) {
+                double yv = Y.at<float>(y, x);
                 if (!colour) out.at<uchar>(y, x) = (uchar)yv;
                 else {
                     double k = yv / std::max((double)gray.at<float>(y, x), 1.0);

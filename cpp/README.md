@@ -26,11 +26,11 @@ that kink at a crease are kept whole; vertical ones too for landscape pages. Wit
 weigh 8x more (nothing else measures the shape inside the page): on 4 one-photo samples compared
 with the source PDFs, text tilt went from 0.2-0.6 deg rms to 0.07-0.3 deg and tesseract finds
 96.6 % of the PDF's words (OCR of the PDF image itself: 97.2 %).
-`--doc-tone` (`Options::doc_tone`) gives a scanner-app look: ink to black, light grey to white.
-With tesseract's default layout mode (as in Paperless) it matched Genius Scan on the 4 one-photo
-samples (96.2 vs 96.1 % of the PDF's words, 90.9 % without), but lost 3-9 % on pages with light
-grey text (CV headings, UML card), so it is off by default. The output is turned so the text
-is upright (text line direction, ascenders vs descenders); `--no-rotate` turns that off.
+`--doc-tone` (`Options::doc_tone`, the app's "Clean look", on there): black ink on white paper.
+The black point follows the darkest ink within ~3 mm, so thin print that the camera blurs to grey
+is darkened rather than faded. Over 9 test pages OCR is unchanged by it (tesseract psm 3:
+92.1 vs 93.0 %, psm 6: 89.7 vs 89.3 %); a plain global curve lost 10 % of a form's fine print.
+The output is turned so the text is upright (text line direction, ascenders vs descenders); `--no-rotate` turns that off.
 
 Library API (`src/docscan.hpp`): `cv::Mat docscan::process(images, options)`; throws
 `std::runtime_error` with a user-facing message (1 to 8 photos). The CLI reads the focal length from EXIF
