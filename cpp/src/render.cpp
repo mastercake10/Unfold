@@ -327,4 +327,64 @@ cv::Mat clean_paper(const cv::Mat& img) {
     return out;
 }
 
+// Text lines of an upright grey page at about 6 px/mm: ink per row of each line, summed as
+// ascender minus descender ink (positive for upright Latin text); n: lines found.
+static void line_profile(const cv::Mat& g, double ppm, int& n, double& score) {
+    const int px = std::max(1, (int)std::lround(ppm));
+    cv::Mat ink, blob, lab, stats, cent;
+    cv::adaptiveThreshold(g, ink, 255, cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY_INV, 15 * px | 1, 12);
+    cv::morphologyEx(ink, blob, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(4 * px, 1)));
+    int nc = cv::connectedComponentsWithStats(blob, lab, stats, cent, 8, CV_32S);
+    n = 0;
+    double up = 0, down = 0;
+    for (int k = 1; k < nc; k++) {
+        int x0 = stats.at<int>(k, cv::CC_STAT_LEFT), y0 = stats.at<int>(k, cv::CC_STAT_TOP);
+        int w = stats.at<int>(k, cv::CC_STAT_WIDTH), h = stats.at<int>(k, cv::CC_STAT_HEIGHT);
+        if (w < 25 * ppm || h > 7 * ppm || h < 1.5 * ppm || w < 6 * h) continue;
+        std::vector<int> prof(h, 0);
+        for (int y = 0; y < h; y++) {
+            const int* l = lab.ptr<int>(y0 + y);
+            const uchar* q = ink.ptr<uchar>(y0 + y);
+            for (int x = x0; x < x0 + w; x++) prof[y] += l[x] == k && q[x];
+        }
+        int mx = *std::max_element(prof.begin(), prof.end());
+        int top = 0, bot = h - 1;
+        while (top < h && prof[top] < mx / 2) top++;
+        while (bot > 0 && prof[bot] < mx / 2) bot--;
+        if (bot - top < 2) continue;  // a ruled line, not text
+        double a = 0, b = 0, c = 0;
+        for (int y = 0; y < h; y++) (y < top ? a : y > bot ? b : c) += prof[y];
+        if (c <= 0) continue;
+        up += a / c, down += b / c;
+        n++;
+    }
+    score = n ? (up - down) / n : 0;
+}
+
+int text_rotation(const cv::Mat& img, double ppm, std::string* info) {
+    cv::Mat g = img;
+    if (g.channels() == 3) cv::cvtColor(img, g, cv::COLOR_BGR2GRAY);
+    double f = std::min(1.0, 6.0 / ppm);
+    if (f < 1) cv::resize(g, g, cv::Size(), f, f, cv::INTER_AREA);
+    ppm *= f;
+    int n[4];
+    double sc[4];
+    cv::Mat r[4];
+    r[0] = g;
+    cv::rotate(g, r[1], cv::ROTATE_90_CLOCKWISE);
+    cv::rotate(g, r[2], cv::ROTATE_180);
+    cv::rotate(g, r[3], cv::ROTATE_90_COUNTERCLOCKWISE);
+    parallel_for(cv::Range(0, 4), [&](const cv::Range& rg) {
+        for (int k = rg.start; k < rg.end; k++) line_profile(r[k], ppm, n[k], sc[k]);
+    });
+    // lines found upright vs upside down are the same lines: compare 0/180 with 90/270
+    int hz = n[0] + n[2], vt = n[1] + n[3];
+    int best = hz >= vt ? (sc[0] >= sc[2] ? 0 : 2) : (sc[1] >= sc[3] ? 1 : 3);
+    if (info)
+        *info = fmt("text lines %d horizontal, %d vertical; ascender score %+.2f / %+.2f", hz / 2, vt / 2,
+                    hz >= vt ? sc[0] : sc[1], hz >= vt ? sc[2] : sc[3]);
+    if (std::max(hz, vt) < 2 * 3) return 0;
+    return best * 90;
+}
+
 }  // namespace docscan

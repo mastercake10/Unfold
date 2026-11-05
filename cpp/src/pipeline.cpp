@@ -843,7 +843,15 @@ cv::Mat Session::Impl::correct_render(Flat& fl) const {
     cv::Mat alb = remove_shading(R.img, valid, R.nu, R.nv);
     double t_shading = secs(t);
     cv::Mat out = clean_paper(to_uint8(alb));
-    log(fmt("  warp %.2f s, shading %.2f s, paper %.2f s", t_render, t_shading, secs(t)));
+    double t_paper = secs(t);
+    if (opt.rotate) {
+        std::string info;
+        int rot = text_rotation(out, opt.dpi / 25.4, &info);
+        log(fmt("  orientation: %s -> rotate %d deg (%.2f s)", info.c_str(), rot, secs(t)));
+        if (rot) cv::rotate(out, out, rot == 90 ? cv::ROTATE_90_CLOCKWISE : rot == 180 ? cv::ROTATE_180
+                                                                                   : cv::ROTATE_90_COUNTERCLOCKWISE);
+    }
+    log(fmt("  warp %.2f s, shading %.2f s, paper %.2f s", t_render, t_shading, t_paper));
     return out;
 }
 

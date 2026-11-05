@@ -24,6 +24,7 @@ struct Options {
     double ruling = 20;                 // stiffness along the folds when the page bends one way
     double anchor_w = 0.1;              // how strongly measured content resists line straightening
     bool gpu = true;                    // SIFT on the GPU (Vulkan) if built in and available
+    bool rotate = true;                 // turn the output so the text is upright
 };
 
 // images: reference view first (rendered), then 1-7 more views, BGR, same camera and size.
