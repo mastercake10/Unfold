@@ -1,0 +1,108 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Scale-space extrema of one octave with subpixel refinement, contrast and edge tests
+// (cv::SIFT findScaleSpaceExtrema + adjustLocalExtrema). The DoG is computed on the fly.
+// The 3x3x3 test reads a tile of the DoG layers from shared memory, built once per workgroup.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+layout(push_constant) uniform PC { int o, w, h; float contrast, edge; } pc;
+
+int W, H;
+float D(int l, int y, int x) { int i = y * W + x; return rd(l + 1, i) - rd(l, i); }
+
+// 16x16 pixels and a 1-pixel halo of the 5 DoG layers
+const int T = 18;
+shared float dog[5][T * T];
+
+void refine(int layer, int r, int c) {
+    const float img_scale = 1.0 / 255.0;
+    const float deriv_scale = img_scale * 0.5, second_scale = img_scale, cross_scale = img_scale * 0.25;
+    float xi = 0.0, xr = 0.0, xc = 0.0;
+    int i;
+    for (i = 0; i < 5; i++) {
+        vec3 dD = vec3((D(layer, r, c + 1) - D(layer, r, c - 1)) * deriv_scale,
+                       (D(layer, r + 1, c) - D(layer, r - 1, c)) * deriv_scale,
+                       (D(layer + 1, r, c) - D(layer - 1, r, c)) * deriv_scale);
+        float v2 = D(layer, r, c) * 2.0;
+        float dxx = (D(layer, r, c + 1) + D(layer, r, c - 1) - v2) * second_scale;
+        float dyy = (D(layer, r + 1, c) + D(layer, r - 1, c) - v2) * second_scale;
+        float dss = (D(layer + 1, r, c) + D(layer - 1, r, c) - v2) * second_scale;
+        float dxy = (D(layer, r + 1, c + 1) - D(layer, r + 1, c - 1) - D(layer, r - 1, c + 1) +
+                     D(layer, r - 1, c - 1)) * cross_scale;
+        float dxs = (D(layer + 1, r, c + 1) - D(layer + 1, r, c - 1) - D(layer - 1, r, c + 1) +
+                     D(layer - 1, r, c - 1)) * cross_scale;
+        float dys = (D(layer + 1, r + 1, c) - D(layer + 1, r - 1, c) - D(layer - 1, r + 1, c) +
+                     D(layer - 1, r - 1, c)) * cross_scale;
+        mat3 Hm = mat3(dxx, dxy, dxs, dxy, dyy, dys, dxs, dys, dss);
+        float det = determinant(Hm);
+        vec3 X = det != 0.0 ? inverse(Hm) * dD : vec3(0.0);  // Matx::solve gives zeros if singular
+        xi = -X.z;
+        xr = -X.y;
+        xc = -X.x;
+        if (abs(xi) < 0.5 && abs(xr) < 0.5 && abs(xc) < 0.5) break;
+        if (abs(xi) > 715827882.0 || abs(xr) > 715827882.0 || abs(xc) > 715827882.0) return;
+        c += int(roundEven(xc));
+        r += int(roundEven(xr));
+        layer += int(roundEven(xi));
+        if (layer < 1 || layer > LAYERS || c < BORDER || c >= W - BORDER || r < BORDER || r >= H - BORDER) return;
+    }
+    if (i >= 5) return;
+    vec3 dD = vec3((D(layer, r, c + 1) - D(layer, r, c - 1)) * deriv_scale,
+                   (D(layer, r + 1, c) - D(layer, r - 1, c)) * deriv_scale,
+                   (D(layer + 1, r, c) - D(layer - 1, r, c)) * deriv_scale);
+    float t = dot(dD, vec3(xc, xr, xi));
+    float contr = D(layer, r, c) * img_scale + t * 0.5;
+    if (abs(contr) * float(LAYERS) < pc.contrast) return;
+    float v2 = D(layer, r, c) * 2.0;
+    float dxx = (D(layer, r, c + 1) + D(layer, r, c - 1) - v2) * second_scale;
+    float dyy = (D(layer, r + 1, c) + D(layer, r - 1, c) - v2) * second_scale;
+    float dxy = (D(layer, r + 1, c + 1) - D(layer, r + 1, c - 1) - D(layer, r - 1, c + 1) +
+                 D(layer, r - 1, c - 1)) * cross_scale;
+    float tr = dxx + dyy, det = dxx * dyy - dxy * dxy;
+    if (det <= 0.0 || tr * tr * pc.edge >= (pc.edge + 1.0) * (pc.edge + 1.0) * det) return;
+
+    uint k = atomicAdd(IO.v[CNT], 1u);
+    if (k >= uint(EXT_CAP)) return;
+    int e = EXT + int(k) * 8;
+    iow(e, float(c) + xc);
+    iow(e + 1, float(r) + xr);
+    iow(e + 2, float(pc.o));
+    iow(e + 3, float(layer));
+    iow(e + 4, xi);
+    iow(e + 5, abs(contr));
+    iow(e + 6, float(c));
+    iow(e + 7, float(r));
+}
+
+void main() {
+    W = pc.w;
+    H = pc.h;
+    int t = int(gl_LocalInvocationIndex);
+    int bx = int(gl_WorkGroupID.x) * 16 - 1, by = int(gl_WorkGroupID.y) * 16 - 1;
+    for (int i = t; i < T * T; i += 256) {
+        int x = clamp(bx + i % T, 0, W - 1), y = clamp(by + i / T, 0, H - 1), k = y * W + x;
+        float g0 = L0.v[k], g1 = L1.v[k], g2 = L2.v[k], g3 = L3.v[k], g4 = L4.v[k], g5 = L5.v[k];
+        dog[0][i] = g1 - g0;
+        dog[1][i] = g2 - g1;
+        dog[2][i] = g3 - g2;
+        dog[3][i] = g4 - g3;
+        dog[4][i] = g5 - g4;
+    }
+    barrier();
+    int c = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
+    if (c < BORDER || c >= W - BORDER || r < BORDER || r >= H - BORDER) return;
+    int q = (int(gl_LocalInvocationID.y) + 1) * T + int(gl_LocalInvocationID.x) + 1;
+    for (int layer = 1; layer <= LAYERS; layer++) {
+        float val = dog[layer][q];
+        if (val == 0.0) continue;  // |val| > threshold, which is 0 for contrast 0.02
+        bool mx = val > 0.0, ok = true;
+        for (int l = layer - 1; l <= layer + 1 && ok; l++)
+            for (int dy = -T; dy <= T && ok; dy += T)
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (l == layer && dy == 0 && dx == 0) continue;
+                    float v = dog[l][q + dy + dx];
+                    if (mx ? val < v : val > v) { ok = false; break; }
+                }
+        if (ok) refine(layer, r, c);
+    }
+}

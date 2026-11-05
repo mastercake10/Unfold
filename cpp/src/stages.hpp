@@ -3,17 +3,24 @@
 
 #include <array>
 
+#include <opencv2/flann.hpp>
+
 #include "common.hpp"
 
 namespace docscan {
 
 // ------------------------------------------------------------ page and matching (matching.cpp)
-bool find_page_quad(const cv::Mat& img, std::array<Vec2, 4>& quad, cv::Mat& mask);
+// img: BGR or grey; work_side: long side of the internal working image (1000 in the pipeline)
+bool find_page_quad(const cv::Mat& img, std::array<Vec2, 4>& quad, cv::Mat& mask, int work_side = 1000);
 std::array<Vec2, 4> refine_quad(const cv::Mat& gray, const std::array<Vec2, 4>& quad, int half = 25, int n = 40);
 void page_outline(const cv::Mat& gray, const cv::Mat& mask, Pts2& out, std::vector<char>& ok, double step = 4.0,
                   int half = 18);
-void sift_detect(const cv::Mat& g, const cv::Mat& mask, int n_features, Pts2& pts, cv::Mat& desc);
-void match_ref(const cv::Mat& d0, const Pts2& pts, const cv::Mat& d, std::vector<int>& i0, Pts2& pj);
+// gpu: use GpuSift if built in and available (else OpenCV on the CPU)
+void sift_detect(const cv::Mat& g, const cv::Mat& mask, int n_features, Pts2& pts, cv::Mat& desc, bool gpu = false);
+// FLANN index (4 random kd-trees) of descriptors; keeps a reference to d
+cv::Ptr<cv::flann::Index> flann_index(const cv::Mat& d);
+void match_ref(const cv::Mat& d0, cv::flann::Index* index0, const Pts2& pts, const cv::Mat& d, int seed,
+               std::vector<int>& i0, Pts2& pj);
 cv::Mat essential(const Pts2& q0, const Pts2& qj, const Cam& cam, double threshold, std::vector<char>& inl);
 void recover_pose(const cv::Mat& E, const Pts2& q0, const Pts2& qj, const Cam& cam, Pose& P);
 double page_coverage(const Pts2& pts, const cv::Mat& mask, int n = 8);

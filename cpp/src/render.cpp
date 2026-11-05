@@ -5,6 +5,8 @@
 
 #include "stages.hpp"
 
+#include <chrono>
+
 namespace docscan {
 
 static inline uchar trunc8(double v) { return (uchar)std::clamp(v, 0.0, 255.0); }  // numpy astype(uint8)
@@ -34,7 +36,7 @@ Render render_flat(const cv::Mat& img, const Cam& cam, const Frame& F, const Sur
     R.page.create(oh, ow, CV_8U);
     R.nu.create(oh, ow, CV_32F);
     R.nv.create(oh, ow, CV_32F);
-    cv::parallel_for_(cv::Range(0, oh), [&](const cv::Range& rg) {
+    parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
         for (int y = rg.start; y < rg.end; y++) {
             float sy = (float)((y + 0.5) / ppm / res);
             for (int x = 0; x < ow; x++) {
@@ -74,14 +76,30 @@ cv::Mat gray_u8(const cv::Mat& img32, const cv::Mat& page) {
 // Divide out illumination: log-luminance of the paper modelled as a low-order function of
 // position and surface normal (fold shading), fitted to the upper envelope (ink is darker
 // and down-weighted), then a medium-scale residual correction.
+// Wide Gaussian blur on a downscaled grid (the fields blurred here are smooth anyway).
+static void wide_blur(const cv::Mat& src, cv::Mat& dst, double sig) {
+    int f = (int)(sig / 4);
+    if (f < 2) {
+        cv::GaussianBlur(src, dst, cv::Size(0, 0), sig);
+        return;
+    }
+    cv::Mat sm;
+    cv::resize(src, sm, cv::Size(), 1.0 / f, 1.0 / f, cv::INTER_AREA);
+    // area averaging already blurs by about f/sqrt(12) px
+    cv::GaussianBlur(sm, sm, cv::Size(0, 0), std::sqrt(std::max(sig * sig / (f * f) - 1.0 / 12, 0.25)));
+    cv::resize(sm, dst, src.size(), 0, 0, cv::INTER_LINEAR);
+}
+
 cv::Mat remove_shading(const cv::Mat& img, const cv::Mat& valid, const cv::Mat& nu, const cv::Mat& nv) {
     const int sub = 4, oh = img.rows, ow = img.cols, nf = 15;
     cv::Mat L(oh, ow, CV_32F);
-    for (int y = 0; y < oh; y++)
-        for (int x = 0; x < ow; x++) {
-            const cv::Vec3f& p = img.at<cv::Vec3f>(y, x);
-            L.at<float>(y, x) = std::log(std::max((p[0] + p[1] + p[2]) / 3.0f, 1.0f));
-        }
+    parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; y++)
+            for (int x = 0; x < ow; x++) {
+                const cv::Vec3f& p = img.at<cv::Vec3f>(y, x);
+                L.at<float>(y, x) = std::log(std::max((p[0] + p[1] + p[2]) / 3.0f, 1.0f));
+            }
+    });
     auto feats = [](double s, double t, double a, double b, double* f) {
         double v[nf] = {1, s, t, s * s, s * t, t * t, s * s * s, s * s * t, s * t * t, t * t * t, a, b, a * a, b * b, a * b};
         std::copy(v, v + nf, f);
@@ -100,58 +118,88 @@ cv::Mat remove_shading(const cv::Mat& img, const cv::Mat& valid, const cv::Mat& 
     Eigen::Map<Eigen::VectorXd> yv(ys.data(), n);
     Eigen::VectorXd w = Eigen::VectorXd::Ones(n);
     Eigen::Matrix<double, nf, 1> beta = Eigen::Matrix<double, nf, 1>::Zero();
+    // normal equations summed over fixed row blocks in parallel (same result for any thread count)
+    const int nb = 64, bl = (int)((n + nb - 1) / nb);
+    std::vector<Eigen::Matrix<double, nf, nf>> Ab(nb);
+    std::vector<Eigen::Matrix<double, nf, 1>> rb(nb);
     for (int it = 0; it < 12; it++) {
-        Eigen::Matrix<double, nf, nf> A = P.transpose() * w.asDiagonal() * P;
-        Eigen::Matrix<double, nf, 1> rhs = P.transpose() * w.cwiseProduct(yv);
+        parallel_for(cv::Range(0, nb), [&](const cv::Range& rg) {
+            for (int b = rg.start; b < rg.end; b++) {
+                int a = std::min((int)n, b * bl), len = std::min((int)n, a + bl) - a;
+                auto Pb = P.middleRows(a, len);
+                auto wb = w.segment(a, len);
+                Ab[b] = Pb.transpose() * wb.asDiagonal() * Pb;
+                rb[b] = Pb.transpose() * wb.cwiseProduct(yv.segment(a, len));
+            }
+        });
+        Eigen::Matrix<double, nf, nf> A = Eigen::Matrix<double, nf, nf>::Zero();
+        Eigen::Matrix<double, nf, 1> rhs = Eigen::Matrix<double, nf, 1>::Zero();
+        for (int b = 0; b < nb; b++) A += Ab[b], rhs += rb[b];
         beta = A.completeOrthogonalDecomposition().solve(rhs);
-        Eigen::VectorXd r = yv - P * beta;
         double sn = it < 3 ? 0.25 : 0.08;  // start tolerant, then hug the paper level
-        for (size_t i = 0; i < n; i++)
-            w[i] = r[i] < 0 ? 1 / (1 + std::pow(r[i] / sn, 2)) : 1 / (1 + std::pow(r[i] / 0.05, 2));
+        parallel_for(cv::Range(0, (int)n), [&](const cv::Range& rg) {
+            for (int i = rg.start; i < rg.end; i++) {
+                double r = yv[i] - P.row(i).dot(beta);
+                w[i] = r < 0 ? 1 / (1 + std::pow(r / sn, 2)) : 1 / (1 + std::pow(r / 0.05, 2));
+            }
+        });
     }
     cv::Mat S(oh, ow, CV_32F), resm(oh, ow, CV_32F), paper(oh, ow, CV_32F);
-    for (int y = 0; y < oh; y++)
-        for (int x = 0; x < ow; x++) {
-            double f[nf];
-            feats((double)x / ow * 2 - 1, (double)y / oh * 2 - 1, nu.at<float>(y, x), nv.at<float>(y, x), f);
-            double s = 0;
-            for (int k = 0; k < nf; k++) s += f[k] * beta[k];
-            S.at<float>(y, x) = (float)s;
-            float r = L.at<float>(y, x) - (float)s;
-            bool pp = valid.at<uchar>(y, x) && r > -0.10f && r < 0.10f;
-            paper.at<float>(y, x) = pp;
-            resm.at<float>(y, x) = pp ? r : 0.f;
-        }
+    parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; y++)
+            for (int x = 0; x < ow; x++) {
+                double f[nf];
+                feats((double)x / ow * 2 - 1, (double)y / oh * 2 - 1, nu.at<float>(y, x), nv.at<float>(y, x), f);
+                double s = 0;
+                for (int k = 0; k < nf; k++) s += f[k] * beta[k];
+                S.at<float>(y, x) = (float)s;
+                float r = L.at<float>(y, x) - (float)s;
+                bool pp = valid.at<uchar>(y, x) && r > -0.10f && r < 0.10f;
+                paper.at<float>(y, x) = pp;
+                resm.at<float>(y, x) = pp ? r : 0.f;
+            }
+    });
     // residual correction on paper pixels (normalized convolution), wide fallback where
     // paper evidence is sparse
     double sig = std::max(oh, ow) / 200.0;
     cv::Mat num, den, num2, den2;
-    cv::GaussianBlur(resm, num, cv::Size(0, 0), sig);
-    cv::GaussianBlur(paper, den, cv::Size(0, 0), sig);
-    cv::GaussianBlur(resm, num2, cv::Size(0, 0), 6 * sig);
-    cv::GaussianBlur(paper, den2, cv::Size(0, 0), 6 * sig);
+    parallel_for(cv::Range(0, 4), [&](const cv::Range& rg) {  // OpenCV runs each blur on one core
+        for (int k = rg.start; k < rg.end; k++) {
+            if (k == 0) cv::GaussianBlur(resm, num, cv::Size(0, 0), sig);
+            if (k == 1) cv::GaussianBlur(paper, den, cv::Size(0, 0), sig);
+            if (k == 2) wide_blur(resm, num2, 6 * sig);
+            if (k == 3) wide_blur(paper, den2, 6 * sig);
+        }
+    });
     cv::Mat alb(oh, ow, CV_32FC3);
-    std::vector<double> ch[3];
-    for (int y = 0; y < oh; y++)
-        for (int x = 0; x < ow; x++) {
-            float d = den.at<float>(y, x), d2 = den2.at<float>(y, x);
-            float corr = d > 0.05f ? num.at<float>(y, x) / std::max(d, 1e-6f) : 0.f;
-            float corr2 = d2 > 1e-3f ? num2.at<float>(y, x) / std::max(d2, 1e-6f) : 0.f;
-            float blend = std::clamp((d - 0.05f) / 0.25f, 0.f, 1.f);
-            float s = S.at<float>(y, x) + blend * corr + (1 - blend) * corr2;
-            float e = std::exp(s);
-            cv::Vec3f a = img.at<cv::Vec3f>(y, x) / e;
-            alb.at<cv::Vec3f>(y, x) = a;
-            if (paper.at<float>(y, x) > 0)
-                for (int c = 0; c < 3; c++) ch[c].push_back(a[c]);
-        }
+    parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; y++)
+            for (int x = 0; x < ow; x++) {
+                float d = den.at<float>(y, x), d2 = den2.at<float>(y, x);
+                float corr = d > 0.05f ? num.at<float>(y, x) / std::max(d, 1e-6f) : 0.f;
+                float corr2 = d2 > 1e-3f ? num2.at<float>(y, x) / std::max(d2, 1e-6f) : 0.f;
+                float blend = std::clamp((d - 0.05f) / 0.25f, 0.f, 1.f);
+                float s = S.at<float>(y, x) + blend * corr + (1 - blend) * corr2;
+                alb.at<cv::Vec3f>(y, x) = img.at<cv::Vec3f>(y, x) / std::exp(s);
+            }
+    });
     float gains[3];
-    for (int c = 0; c < 3; c++) gains[c] = ch[c].empty() ? 1.f : (float)median(ch[c]);
-    for (int y = 0; y < oh; y++)
-        for (int x = 0; x < ow; x++) {
-            cv::Vec3f& a = alb.at<cv::Vec3f>(y, x);
-            for (int c = 0; c < 3; c++) a[c] /= gains[c];
+    parallel_for(cv::Range(0, 3), [&](const cv::Range& rg) {
+        for (int c = rg.start; c < rg.end; c++) {
+            std::vector<double> ch;
+            for (int y = 0; y < oh; y++)
+                for (int x = 0; x < ow; x++)
+                    if (paper.at<float>(y, x) > 0) ch.push_back(alb.at<cv::Vec3f>(y, x)[c]);
+            gains[c] = ch.empty() ? 1.f : (float)median(ch);
         }
+    });
+    parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; y++)
+            for (int x = 0; x < ow; x++) {
+                cv::Vec3f& a = alb.at<cv::Vec3f>(y, x);
+                for (int c = 0; c < 3; c++) a[c] /= gains[c];
+            }
+    });
     return alb;
 }
 
@@ -159,15 +207,17 @@ cv::Mat remove_shading(const cv::Mat& img, const cv::Mat& valid, const cv::Mat& 
 // near-neutral pixels made neutral, real colours kept.
 cv::Mat to_uint8(const cv::Mat& alb, double white) {
     cv::Mat out(alb.size(), CV_8UC3);
-    for (int y = 0; y < alb.rows; y++)
-        for (int x = 0; x < alb.cols; x++) {
-            const cv::Vec3f& a = alb.at<cv::Vec3f>(y, x);
-            float g = (a[0] + a[1] + a[2]) / 3;
-            float sat = std::max({std::abs(a[0] - g), std::abs(a[1] - g), std::abs(a[2] - g)});
-            float keep = std::clamp((sat - 0.03f) / 0.05f, 0.f, 1.f);
-            cv::Vec3b& o = out.at<cv::Vec3b>(y, x);
-            for (int c = 0; c < 3; c++) o[c] = trunc8((g + (a[c] - g) * keep) * 255 * white);
-        }
+    parallel_for(cv::Range(0, alb.rows), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; y++)
+            for (int x = 0; x < alb.cols; x++) {
+                const cv::Vec3f& a = alb.at<cv::Vec3f>(y, x);
+                float g = (a[0] + a[1] + a[2]) / 3;
+                float sat = std::max({std::abs(a[0] - g), std::abs(a[1] - g), std::abs(a[2] - g)});
+                float keep = std::clamp((sat - 0.03f) / 0.05f, 0.f, 1.f);
+                cv::Vec3b& o = out.at<cv::Vec3b>(y, x);
+                for (int c = 0; c < 3; c++) o[c] = trunc8((g + (a[c] - g) * keep) * 255 * white);
+            }
+    });
     return out;
 }
 
@@ -192,52 +242,69 @@ cv::Mat clean_paper(const cv::Mat& img) {
     const double near = 0.10;
     int oh = img.rows, ow = img.cols;
     cv::Mat gray(oh, ow, CV_32F), colmask(oh, ow, CV_8U), g8(oh, ow, CV_8U);
-    for (int y = 0; y < oh; y++)
-        for (int x = 0; x < ow; x++) {
-            const cv::Vec3b& p = img.at<cv::Vec3b>(y, x);
-            double g = (p[0] + p[1] + p[2]) / 3.0;
-            gray.at<float>(y, x) = (float)g;
-            double ch = std::max({std::abs(p[0] - g), std::abs(p[1] - g), std::abs(p[2] - g)});
-            colmask.at<uchar>(y, x) = ch > 15;
-            g8.at<uchar>(y, x) = trunc8(g);
-        }
+    parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; y++)
+            for (int x = 0; x < ow; x++) {
+                const cv::Vec3b& p = img.at<cv::Vec3b>(y, x);
+                double g = (p[0] + p[1] + p[2]) / 3.0;
+                gray.at<float>(y, x) = (float)g;
+                double ch = std::max({std::abs(p[0] - g), std::abs(p[1] - g), std::abs(p[2] - g)});
+                colmask.at<uchar>(y, x) = ch > 15;
+                g8.at<uchar>(y, x) = trunc8(g);
+            }
+    });
     cv::medianBlur(colmask, colmask, 5);
     bool colour = cv::mean(colmask)[0] > 1e-3;
     cv::Mat gd, g;
+    auto t = std::chrono::steady_clock::now();
     cv::fastNlMeansDenoising(g8, gd, 4.0f, 7, 21);
+    log(fmt("    denoising %.2f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count()));
     gd.convertTo(g, CV_32F);
     double P0, s0;
-    if (!paper_level(g, P0, s0)) {
+    bool found = false;
+    // local paper level: ink removed by a closing, then smoothed (alongside the global level)
+    cv::Mat bg;
+    parallel_for(cv::Range(0, 2), [&](const cv::Range& rg) {
+        for (int k = rg.start; k < rg.end; k++) {
+            if (k == 0) found = paper_level(g, P0, s0);
+            if (k == 1) {
+                cv::morphologyEx(g, bg, cv::MORPH_CLOSE,
+                                 cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
+                cv::GaussianBlur(bg, bg, cv::Size(0, 0), 6.0);
+            }
+        }
+    });
+    if (!found) {
         if (colour) return img;
         return g8;
     }
-    // local paper level: ink removed by a closing, then smoothed
-    cv::Mat bg;
-    cv::morphologyEx(g, bg, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
-    cv::GaussianBlur(bg, bg, cv::Size(0, 0), 6.0);
     cv::Mat e(oh, ow, CV_32F);
-    for (int i = 0; i < oh * ow; i++) {
-        double ratio = ((float*)bg.data)[i] / P0;
-        double w = std::clamp((ratio - (1 - near)) / (near / 2), 0.0, 1.0);
-        ((float*)e.data)[i] = (float)(((float*)g.data)[i] * (1 + w * (1 / std::max(ratio, 1e-3) - 1)));
-    }
+    parallel_for(cv::Range(0, oh * ow), [&](const cv::Range& rg) {
+        for (int i = rg.start; i < rg.end; i++) {
+            double ratio = ((float*)bg.data)[i] / P0;
+            double w = std::clamp((ratio - (1 - near)) / (near / 2), 0.0, 1.0);
+            ((float*)e.data)[i] = (float)(((float*)g.data)[i] * (1 + w * (1 / std::max(ratio, 1e-3) - 1)));
+        }
+    });
     double P = P0, s = s0;
     paper_level(e, P, s);
     s = std::max(s, 2.0);
     double lo = P - 4 * s - 4, hi = P - s;
     cv::Mat out(oh, ow, colour ? CV_8UC3 : CV_8U);
-    for (int y = 0; y < oh; y++)
-        for (int x = 0; x < ow; x++) {
-            double v = e.at<float>(y, x);
-            double yv = v <= lo ? v : lo + (v - lo) * (255 - lo) / std::max(hi - lo, 1e-3);
-            yv = std::clamp(yv, 0.0, 255.0);
-            if (!colour) out.at<uchar>(y, x) = (uchar)yv;
-            else {
-                double k = yv / std::max((double)gray.at<float>(y, x), 1.0);
-                const cv::Vec3b& p = img.at<cv::Vec3b>(y, x);
-                for (int c = 0; c < 3; c++) out.at<cv::Vec3b>(y, x)[c] = trunc8(p[c] * k);
+    parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+        for (int y = rg.start; y < rg.end; y++)
+            for (int x = 0; x < ow; x++) {
+                double v = e.at<float>(y, x);
+                double yv = v <= lo ? v : lo + (v - lo) * (255 - lo) / std::max(hi - lo, 1e-3);
+                yv = std::clamp(yv, 0.0, 255.0);
+                if (!colour) out.at<uchar>(y, x) = (uchar)yv;
+                else {
+                    double k = yv / std::max((double)gray.at<float>(y, x), 1.0);
+                    const cv::Vec3b& p = img.at<cv::Vec3b>(y, x);
+                    for (int c = 0; c < 3; c++) out.at<cv::Vec3b>(y, x)[c] = trunc8(p[c] * k);
+                }
             }
-        }
+    });
     return out;
 }
 

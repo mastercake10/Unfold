@@ -1,0 +1,27 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// 8-bit tile -> float, 2x bilinear upscale (cv::resize INTER_LINEAR)
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+layout(push_constant) uniform PC { int sw, sh, dw, dh, dst; } pc;  // dst: binding
+
+float px(int x, int y) {
+    int i = y * pc.sw + x;
+    return float((IO.v[SRC + (i >> 2)] >> ((i & 3) * 8)) & 255u);
+}
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.dw || y >= pc.dh) return;
+    float sx = (float(x) + 0.5) * 0.5 - 0.5, sy = (float(y) + 0.5) * 0.5 - 0.5;
+    int x0 = int(floor(sx)), y0 = int(floor(sy));
+    float fx = sx - float(x0), fy = sy - float(y0);
+    if (x0 < 0) { x0 = 0; fx = 0.0; }
+    if (y0 < 0) { y0 = 0; fy = 0.0; }
+    if (x0 >= pc.sw - 1) { x0 = pc.sw - 1; fx = 0.0; }
+    if (y0 >= pc.sh - 1) { y0 = pc.sh - 1; fy = 0.0; }
+    int x1 = min(x0 + 1, pc.sw - 1), y1 = min(y0 + 1, pc.sh - 1);
+    float a = px(x0, y0) * (1.0 - fx) + px(x1, y0) * fx;
+    float b = px(x0, y1) * (1.0 - fx) + px(x1, y1) * fx;
+    wr(pc.dst, y * pc.dw + x, a * (1.0 - fy) + b * fy);
+}

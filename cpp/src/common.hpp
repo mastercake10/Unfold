@@ -128,4 +128,24 @@ struct Grid {
     double sample(const std::vector<double>& Z, double u, double v) const;
 };
 
+// A thread with a 16 MB stack (Android gives new threads about 1 MB); joined on destruction.
+// Exceptions thrown by fn are rethrown by join().
+class Thread {
+public:
+    explicit Thread(std::function<void()> fn);
+    ~Thread();
+    void join();
+    Thread(const Thread&) = delete;
+    Thread& operator=(const Thread&) = delete;
+
+private:
+    struct Impl;
+    Impl* p;
+};
+
+// fn over [r.start, r.end) in chunks on all cores (cv::getNumThreads()). Used instead of
+// cv::parallel_for_, which runs serially while any other thread is inside one (on the phone:
+// the page detection of the camera preview). Nested calls run serially.
+void parallel_for(const cv::Range& r, const std::function<void(const cv::Range&)>& fn);
+
 }  // namespace docscan

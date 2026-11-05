@@ -4,24 +4,31 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <thread>
+#include <chrono>
 
 #include "stages.hpp"
+#ifdef DOCSCAN_GPU
+#include "gpu_sift.hpp"
+#endif
 
 namespace docscan {
 
 // ------------------------------------------------------------ page
 
 // Largest bright region, approximated by a quadrilateral (tl, tr, br, bl).
-bool find_page_quad(const cv::Mat& img, std::array<Vec2, 4>& quad, cv::Mat& mask) {
+bool find_page_quad(const cv::Mat& img, std::array<Vec2, 4>& quad, cv::Mat& mask, int work_side) {
     cv::Mat g, sm, th;
-    cv::cvtColor(img, g, cv::COLOR_BGR2GRAY);
-    double small_s = 1000.0 / std::max(g.rows, g.cols);
+    if (img.channels() == 3) cv::cvtColor(img, g, cv::COLOR_BGR2GRAY);
+    else g = img;
+    double small_s = (double)work_side / std::max(g.rows, g.cols);
     cv::resize(g, sm, cv::Size(), small_s, small_s, cv::INTER_AREA);
+    auto ks = [&](int k) { return 2 * (int)std::lround((k - 1) / 2.0 * work_side / 1000.0) + 1; };  // odd, scaled
     // close text strokes so the page becomes one blob
-    cv::morphologyEx(sm, sm, cv::MORPH_CLOSE, cv::Mat::ones(25, 25, CV_8U));
-    cv::GaussianBlur(sm, th, cv::Size(9, 9), 0);
+    cv::morphologyEx(sm, sm, cv::MORPH_CLOSE, cv::Mat::ones(ks(25), ks(25), CV_8U));
+    cv::GaussianBlur(sm, th, cv::Size(ks(9), ks(9)), 0);
     cv::threshold(th, th, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
-    cv::morphologyEx(th, th, cv::MORPH_OPEN, cv::Mat::ones(15, 15, CV_8U));
+    cv::morphologyEx(th, th, cv::MORPH_OPEN, cv::Mat::ones(ks(15), ks(15), CV_8U));
     std::vector<std::vector<cv::Point>> cnts;
     cv::findContours(th, cnts, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
     if (cnts.empty()) return false;
@@ -182,15 +189,65 @@ void page_outline(const cv::Mat& gray, const cv::Mat& mask, Pts2& out, std::vect
 
 // SIFT on overlapping tiles (OpenCV upsamples 2x internally: ~2 GB on a full photo).
 // Each keypoint is kept by the tile whose core contains it; strongest n_features kept.
-void sift_detect(const cv::Mat& g, const cv::Mat& mask, int n_features, Pts2& pts, cv::Mat& desc) {
+void sift_detect(const cv::Mat& g, const cv::Mat& mask, int n_features, Pts2& pts, cv::Mat& desc, bool gpu) {
     const int ny = 4, nx = 3, overlap = 200;
     int h = g.rows, w = g.cols;
-    auto sift = cv::SIFT::create(0, 3, 0.02);
-    std::vector<Vec2> P;
-    std::vector<float> resp;
-    std::vector<cv::Mat> ds;
-    for (int i = 0; i < ny; i++)
-        for (int j = 0; j < nx; j++) {
+    // tiles run in parallel (SIFT itself is mostly sequential); merged in tile order
+    struct Tile {
+        std::vector<Vec2> P;
+        std::vector<float> resp;
+        std::vector<cv::Mat> ds;
+    };
+    std::vector<Tile> tiles(ny * nx);
+    bool done = false;
+#ifdef DOCSCAN_GPU
+    // GPU: same tiles one after another (each fills the GPU); keypoints filtered by the tile mask and
+    // core region before descriptors are computed
+    if (GpuSift* G = gpu ? GpuSift::get() : nullptr) {
+        done = true;
+        auto t0 = std::chrono::steady_clock::now();
+        for (int t = 0; t < ny * nx && done; t++) {
+            int i = t / nx, j = t % nx;
+            int y0 = (int)(i * ((double)h / ny)), y1 = (int)((i + 1) * ((double)h / ny));
+            int x0 = (int)(j * ((double)w / nx)), x1 = (int)((j + 1) * ((double)w / nx));
+            int Y0 = std::max(y0 - overlap, 0), Y1 = std::min(y1 + overlap, h);
+            int X0 = std::max(x0 - overlap, 0), X1 = std::min(x1 + overlap, w);
+            cv::Rect roi(X0, Y0, X1 - X0, Y1 - Y0);
+            cv::Mat m;
+            if (!mask.empty()) {
+                m = mask(roi);
+                if (cv::countNonZero(m) == 0) continue;
+            }
+            auto keep = [&](const cv::Point2f& p) {
+                if (!m.empty() && !m.at<uchar>((int)(p.y + 0.5f), (int)(p.x + 0.5f))) return false;
+                double x = (double)p.x + X0, y = (double)p.y + Y0;
+                return x0 <= x && x < x1 && y0 <= y && y < y1;
+            };
+            std::vector<cv::KeyPoint> kp;
+            cv::Mat d;
+            if (!G->detect(g(roi).clone(), 0.02f, keep, kp, d)) {
+                done = false;  // GPU error: redo everything on the CPU
+                break;
+            }
+            Tile& T = tiles[t];
+            for (size_t k = 0; k < kp.size(); k++) {
+                T.P.emplace_back((float)((double)kp[k].pt.x + X0), (float)((double)kp[k].pt.y + Y0));
+                T.resp.push_back(kp[k].response);
+                T.ds.push_back(d.row((int)k));
+            }
+        }
+        if (!done) tiles.assign(ny * nx, Tile());
+        auto st = G->take_stats();
+        double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (done && st.pyramid > 0)
+            log(fmt("    gpu: pyramid %.2f s, extrema + orientation %.2f s, descriptors %.2f s, rest %.2f s", st.pyramid,
+                    st.extrema, st.descriptors, wall - st.pyramid - st.extrema - st.descriptors));
+    }
+#endif
+    if (!done) parallel_for(cv::Range(0, ny * nx), [&](const cv::Range& rg) {
+        auto sift = cv::SIFT::create(0, 3, 0.02);
+        for (int t = rg.start; t < rg.end; t++) {
+            int i = t / nx, j = t % nx;
             int y0 = (int)(i * ((double)h / ny)), y1 = (int)((i + 1) * ((double)h / ny));
             int x0 = (int)(j * ((double)w / nx)), x1 = (int)((j + 1) * ((double)w / nx));
             int Y0 = std::max(y0 - overlap, 0), Y1 = std::min(y1 + overlap, h);
@@ -204,15 +261,25 @@ void sift_detect(const cv::Mat& g, const cv::Mat& mask, int n_features, Pts2& pt
             std::vector<cv::KeyPoint> kp;
             cv::Mat d;
             sift->detectAndCompute(g(roi).clone(), m.empty() ? cv::noArray() : cv::InputArray(m.clone()), kp, d);
+            Tile& T = tiles[t];
             for (size_t k = 0; k < kp.size(); k++) {
                 double x = (double)kp[k].pt.x + X0, y = (double)kp[k].pt.y + Y0;
                 if (x0 <= x && x < x1 && y0 <= y && y < y1) {
-                    P.emplace_back((float)x, (float)y);  // float32 like cv::KeyPoint
-                    resp.push_back(kp[k].response);
-                    ds.push_back(d.row((int)k));
+                    T.P.emplace_back((float)x, (float)y);  // float32 like cv::KeyPoint
+                    T.resp.push_back(kp[k].response);
+                    T.ds.push_back(d.row((int)k));
                 }
             }
         }
+    });
+    std::vector<Vec2> P;
+    std::vector<float> resp;
+    std::vector<cv::Mat> ds;
+    for (auto& T : tiles) {
+        P.insert(P.end(), T.P.begin(), T.P.end());
+        resp.insert(resp.end(), T.resp.begin(), T.resp.end());
+        ds.insert(ds.end(), T.ds.begin(), T.ds.end());
+    }
     std::vector<size_t> order(P.size());
     for (size_t i = 0; i < order.size(); i++) order[i] = i;
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return resp[a] > resp[b]; });
@@ -225,22 +292,51 @@ void sift_detect(const cv::Mat& g, const cv::Mat& mask, int n_features, Pts2& pt
     }
 }
 
-// FLANN, mutual nearest neighbours with ratio test 0.85.
-void match_ref(const cv::Mat& d0, const Pts2& pts, const cv::Mat& d, std::vector<int>& i0, Pts2& pj) {
-    cv::FlannBasedMatcher flann(cv::makePtr<cv::flann::KDTreeIndexParams>(4),
-                                cv::makePtr<cv::flann::SearchParams>(32));
-    std::vector<std::vector<cv::DMatch>> m01, m10;
-    flann.knnMatch(d0, d, m01, 2);
-    flann.knnMatch(d, d0, m10, 2);
-    std::vector<int> back(d.rows, -1);
-    for (auto& m : m10)
-        if (m.size() == 2 && m[0].distance < 0.85 * m[1].distance) back[m[0].queryIdx] = m[0].trainIdx;
+cv::Ptr<cv::flann::Index> flann_index(const cv::Mat& d) {
+    if (d.rows < 2) return nullptr;
+    return cv::makePtr<cv::flann::Index>(d, cv::flann::KDTreeIndexParams(4));
+}
+
+// 2 nearest neighbours in the indexed train set of every query row (FLANN, as cv::FlannBasedMatcher
+// with 4 trees / 32 checks), searched in parallel. good[i]: ratio test 0.85 passed.
+static void knn_ratio(const cv::Mat& query, cv::flann::Index* index, std::vector<int>& best,
+                      std::vector<char>& good) {
+    best.assign(query.rows, -1);
+    good.assign(query.rows, 0);
+    if (!index || query.rows == 0) return;
+    cv::Mat ind(query.rows, 2, CV_32S), dist(query.rows, 2, CV_32F);
+    parallel_for(cv::Range(0, query.rows), [&](const cv::Range& r) {
+        cv::Mat ii = ind.rowRange(r.start, r.end), dd = dist.rowRange(r.start, r.end);
+        index->knnSearch(query.rowRange(r.start, r.end), ii, dd, 2, cv::flann::SearchParams(32));
+    });
+    for (int i = 0; i < query.rows; i++) {
+        const int* id = ind.ptr<int>(i);
+        const float* d = dist.ptr<float>(i);  // squared L2; the matcher compares L2
+        if (id[0] < 0 || id[1] < 0) continue;
+        best[i] = id[0];
+        good[i] = std::sqrt(d[0]) < 0.85 * std::sqrt(d[1]);
+    }
+}
+
+// Mutual nearest neighbours with ratio test 0.85. index0: FLANN index of d0 (built once per
+// reference). The index of d is built in a second thread while d is searched in index0.
+void match_ref(const cv::Mat& d0, cv::flann::Index* index0, const Pts2& pts, const cv::Mat& d, int seed,
+               std::vector<int>& i0, Pts2& pj) {
+    std::vector<int> b01, b10;
+    std::vector<char> g01, g10;
+    Thread t([&] {
+        cv::setRNGSeed(seed);  // FLANN tree construction is random
+        auto index = flann_index(d);
+        knn_ratio(d0, index.get(), b01, g01);
+    });
+    knn_ratio(d, index0, b10, g10);
+    t.join();
     i0.clear();
     pj.clear();
-    for (auto& m : m01)
-        if (m.size() == 2 && m[0].distance < 0.85 * m[1].distance && back[m[0].trainIdx] == m[0].queryIdx) {
-            i0.push_back(m[0].queryIdx);
-            pj.push_back(pts[m[0].trainIdx]);
+    for (int i = 0; i < d0.rows; i++)
+        if (g01[i] && g10[b01[i]] && b10[b01[i]] == i) {
+            i0.push_back(i);
+            pj.push_back(pts[b01[i]]);
         }
 }
 
@@ -343,7 +439,7 @@ void local_affines(const Pts2& p1, const Pts2& p2, const Pts2& q, std::vector<Ei
     k = std::min<int>(k, (int)p1.size());
     A.resize(q.size());
     pred.resize(q.size());
-    cv::parallel_for_(cv::Range(0, (int)q.size()), [&](const cv::Range& rg) {
+    parallel_for(cv::Range(0, (int)q.size()), [&](const cv::Range& rg) {
         std::vector<int> idx;
         std::vector<double> dist;
         for (int i = rg.start; i < rg.end; i++) {
@@ -355,7 +451,7 @@ void local_affines(const Pts2& p1, const Pts2& p2, const Pts2& q, std::vector<Ei
             }
             m1 /= idx.size();
             m2 /= idx.size();
-            Eigen::MatrixX2d D1(idx.size(), 2), D2(idx.size(), 2);
+            Eigen::MatrixXd D1(idx.size(), 2), D2(idx.size(), 2);  // dynamic: thin SVD needs it
             for (size_t r = 0; r < idx.size(); r++) {
                 D1.row(r) = (p1[idx[r]] - m1).transpose();
                 D2.row(r) = (p2[idx[r]] - m2).transpose();
@@ -385,7 +481,7 @@ void refine_subpixel(const cv::Mat& g1, const cv::Mat& g2, const Pts2& p1, const
     const int h1 = g1.rows, w1 = g1.cols, h2 = g2.rows, w2 = g2.cols;
     out = p2;
     ok.assign(p1.size(), 0);
-    cv::parallel_for_(cv::Range(0, (int)p1.size()), [&](const cv::Range& rg) {
+    parallel_for(cv::Range(0, (int)p1.size()), [&](const cv::Range& rg) {
         std::vector<float> tpl(win * win), reg(S * S), res(K * K);
         std::vector<double> ci((S + 1) * (S + 1)), ci2((S + 1) * (S + 1));
         for (int i = rg.start; i < rg.end; i++) {

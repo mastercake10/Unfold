@@ -1,0 +1,12 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// every second pixel of the previous octave's level 3 (cv::resize INTER_NEAREST to half size)
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "common.glsl"
+layout(push_constant) uniform PC { int sw, dw, dh; } pc;
+
+void main() {
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= pc.dw || y >= pc.dh) return;
+    wr(0, y * pc.dw + x, PREV.v[(2 * y) * pc.sw + 2 * x]);
+}

@@ -1,0 +1,10 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// indirect dispatch size for the orientation pass: one workgroup per extremum
+layout(local_size_x = 1) in;
+#include "common.glsl"
+void main() {
+    IO.v[CNT + 4] = min(IO.v[CNT], uint(EXT_CAP));
+    IO.v[CNT + 5] = 1u;
+    IO.v[CNT + 6] = 1u;
+}

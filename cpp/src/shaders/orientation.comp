@@ -1,0 +1,78 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Dominant orientations of each extremum (cv::SIFT calcOrientationHist + peak search).
+// One workgroup per extremum; the histogram is accumulated in fixed point (no float atomics).
+layout(local_size_x = 64) in;
+#include "common.glsl"
+layout(push_constant) uniform PC { int o, w, h; } pc;
+
+const int N = 36;
+const float FIX = 1024.0;
+shared int hist_i[N];
+shared float hist[N + 4];
+
+void main() {
+    int e = EXT + int(gl_WorkGroupID.x) * 8;
+    int t = int(gl_LocalInvocationID.x);
+    int o = pc.o, layer = int(iof(e + 3));
+    float xi = iof(e + 4);
+    int c = int(iof(e + 6)), r = int(iof(e + 7));
+    float scl = SIGMA * pow(2.0, (float(layer) + xi) / float(LAYERS));
+    int radius = int(roundEven(4.5 * scl));   // SIFT_ORI_RADIUS
+    float sig = 1.5 * scl;                     // SIFT_ORI_SIG_FCTR
+    float expf_scale = -1.0 / (2.0 * sig * sig);
+    int w = pc.w, h = pc.h;
+    if (t < N) hist_i[t] = 0;
+    barrier();
+    int side = 2 * radius + 1;
+    for (int k = t; k < side * side; k += 64) {
+        int i = k / side - radius, j = k % side - radius;
+        int y = r + i, x = c + j;
+        if (y <= 0 || y >= h - 1 || x <= 0 || x >= w - 1) continue;
+        float dx = rd(layer, y * w + x + 1) - rd(layer, y * w + x - 1);
+        float dy = rd(layer, (y - 1) * w + x) - rd(layer, (y + 1) * w + x);
+        if (dx == 0.0 && dy == 0.0) continue;
+        float wgt = exp(float(i * i + j * j) * expf_scale);
+        float ori = degrees(atan(dy, dx));
+        if (ori < 0.0) ori += 360.0;
+        int bin = int(roundEven(float(N) / 360.0 * ori));
+        if (bin >= N) bin -= N;
+        if (bin < 0) bin += N;
+        atomicAdd(hist_i[bin], int(roundEven(wgt * sqrt(dx * dx + dy * dy) * FIX)));
+    }
+    barrier();
+    if (t != 0) return;
+    float tmp[N + 4];
+    for (int i = 0; i < N; i++) tmp[i + 2] = float(hist_i[i]) / FIX;
+    tmp[0] = tmp[N];
+    tmp[1] = tmp[N + 1];
+    tmp[N + 2] = tmp[2];
+    tmp[N + 3] = tmp[3];
+    float omax = 0.0;
+    for (int i = 0; i < N; i++) {
+        hist[i] = (tmp[i] + tmp[i + 4]) * (1.0 / 16.0) + (tmp[i + 1] + tmp[i + 3]) * (4.0 / 16.0) +
+                  tmp[i + 2] * (6.0 / 16.0);
+        omax = i == 0 ? hist[0] : max(omax, hist[i]);
+    }
+    float thr = omax * 0.8;  // SIFT_ORI_PEAK_RATIO
+    for (int j = 0; j < N; j++) {
+        int l = j > 0 ? j - 1 : N - 1, r2 = j < N - 1 ? j + 1 : 0;
+        if (hist[j] > hist[l] && hist[j] > hist[r2] && hist[j] >= thr) {
+            float bin = float(j) + 0.5 * (hist[l] - hist[r2]) / (hist[l] - 2.0 * hist[j] + hist[r2]);
+            bin = bin < 0.0 ? float(N) + bin : bin >= float(N) ? bin - float(N) : bin;
+            float angle = 360.0 - (360.0 / float(N)) * bin;
+            if (abs(angle - 360.0) < 1.1920929e-7) angle = 0.0;
+            uint k = atomicAdd(IO.v[CNT + 1], 1u);
+            if (k >= uint(KP_CAP)) continue;
+            int q = KP + int(k) * 8;
+            iow(q, iof(e));
+            iow(q + 1, iof(e + 1));
+            iow(q + 2, float(o));
+            iow(q + 3, float(layer));
+            iow(q + 4, scl * 2.0);  // keypoint size in octave pixels
+            iow(q + 5, iof(e + 5));
+            iow(q + 6, angle);
+            iow(q + 7, 0.0);
+        }
+    }
+}

@@ -1,13 +1,33 @@
 #include "common.hpp"
+#include "docscan.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <memory>
+#include <mutex>
 #include <queue>
+#include <exception>
+#include <thread>
+
+#include <pthread.h>
 
 namespace docscan {
 
-void log(const std::string& s) { std::fprintf(stderr, "%s\n", s.c_str()); }
+static std::mutex log_mu;
+static std::function<void(const std::string&)> log_sink;
+
+void set_log_sink(std::function<void(const std::string&)> sink) {
+    std::lock_guard<std::mutex> lk(log_mu);
+    log_sink = std::move(sink);
+}
+
+void log(const std::string& s) {
+    std::lock_guard<std::mutex> lk(log_mu);
+    if (log_sink) log_sink(s);
+    else std::fprintf(stderr, "%s\n", s.c_str());
+}
 
 std::string fmt(const char* f, ...) {
     char buf[1024];
@@ -205,6 +225,83 @@ Eigen::VectorXd least_squares(const ResidFn& fun, Eigen::VectorXd x, Loss loss, 
         if (!accepted || done) break;
     }
     return x;
+}
+
+struct Thread::Impl {
+    std::function<void()> fn;
+    std::exception_ptr err;
+    pthread_t t;
+    bool running = false;
+    static void* run(void* arg) {
+        auto* p = (Impl*)arg;
+        try {
+            p->fn();
+        } catch (...) {
+            p->err = std::current_exception();
+        }
+        return nullptr;
+    }
+};
+
+Thread::Thread(std::function<void()> fn) : p(new Impl) {
+    p->fn = std::move(fn);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16u << 20);
+    p->running = pthread_create(&p->t, &attr, Impl::run, p) == 0;
+    pthread_attr_destroy(&attr);
+    if (!p->running) Impl::run(p);  // no thread available: run here
+}
+
+void Thread::join() {
+    if (p->running) pthread_join(p->t, nullptr);
+    p->running = false;
+    if (p->err) {
+        auto e = p->err;
+        p->err = nullptr;
+        std::rethrow_exception(e);
+    }
+}
+
+Thread::~Thread() {
+    if (p->running) pthread_join(p->t, nullptr);
+    delete p;
+}
+
+static thread_local bool in_parallel = false;
+
+void parallel_for(const cv::Range& r, const std::function<void(const cv::Range&)>& fn) {
+    const int n = r.size();
+    if (n <= 0) return;
+    const int threads = std::min(std::max(cv::getNumThreads(), 1), n);
+    if (threads == 1 || in_parallel) {
+        fn(r);
+        return;
+    }
+    const int chunk = std::max(1, n / (threads * 8));
+    std::atomic<int> next{0};
+    auto work = [&] {
+        bool outer = in_parallel;
+        in_parallel = true;
+        for (int a; (a = next.fetch_add(chunk)) < n;) fn(cv::Range(r.start + a, r.start + std::min(n, a + chunk)));
+        in_parallel = outer;
+    };
+    std::vector<std::unique_ptr<Thread>> th;
+    for (int i = 1; i < threads; i++) th.push_back(std::make_unique<Thread>(work));
+    std::exception_ptr err;
+    try {
+        work();
+    } catch (...) {
+        err = std::current_exception();
+        next = n;  // stop handing out chunks
+    }
+    for (auto& t : th) try {
+            t->join();
+        } catch (...) {
+            if (!err) err = std::current_exception();
+            next = n;
+        }
+    if (err) std::rethrow_exception(err);
 }
 
 }  // namespace docscan

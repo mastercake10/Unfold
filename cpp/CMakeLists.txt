@@ -17,6 +17,18 @@ target_include_directories(docscan PUBLIC src)
 target_link_libraries(docscan PUBLIC ${OpenCV_LIBS} Eigen3::Eigen)
 target_compile_options(docscan PRIVATE -Wall)
 
+# optional GPU SIFT (Vulkan compute)
+find_package(Vulkan)
+find_program(GLSLC glslc)
+if(Vulkan_FOUND AND GLSLC)
+  include(shaders.cmake)
+  target_sources(docscan PRIVATE src/gpu_sift.cpp)
+  docscan_add_shaders(docscan ${GLSLC})
+  target_link_libraries(docscan PUBLIC Vulkan::Vulkan)
+  target_compile_definitions(docscan PUBLIC DOCSCAN_GPU)
+  message(STATUS "GPU SIFT: on")
+endif()
+
 # ... and a command-line tool
 add_executable(docscan_cli src/main.cpp)
 set_target_properties(docscan_cli PROPERTIES OUTPUT_NAME docscan)

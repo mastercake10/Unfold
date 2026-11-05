@@ -1,0 +1,103 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// 128-float SIFT descriptor per keypoint (cv::SIFT calcSIFTDescriptor), one workgroup each;
+// trilinear histogram in fixed point.
+layout(local_size_x = 64) in;
+#include "common.glsl"
+
+const int D = 4, N = 8;
+const float FIX = 256.0;
+shared int hist_i[(D + 2) * (D + 2) * (N + 2)];
+shared float dsc[D * D * N];
+shared float nrm;
+layout(push_constant) uniform PC { int base, w, h; } pc;  // chunked: max 65535 workgroups
+
+void main() {
+    int kid = pc.base + int(gl_WorkGroupID.x);
+    int q = KP + kid * 8;
+    int t = int(gl_LocalInvocationID.x);
+    vec2 ptf = vec2(iof(q), iof(q + 1));
+    int layer = int(iof(q + 3));
+    float scl = iof(q + 4) * 0.5;
+    float ori = 360.0 - iof(q + 6);
+    if (abs(ori - 360.0) < 1.1920929e-7) ori = 0.0;
+    int w = pc.w, h = pc.h;
+    ivec2 pt = ivec2(roundEven(ptf));
+    float cos_t = cos(radians(ori)), sin_t = sin(radians(ori));
+    float bins_per_rad = float(N) / 360.0;
+    float exp_scale = -1.0 / (float(D * D) * 0.5);
+    float hist_width = 3.0 * scl;  // SIFT_DESCR_SCL_FCTR
+    int radius = int(roundEven(hist_width * 1.4142135623730951 * float(D + 1) * 0.5));
+    radius = min(radius, int(sqrt(float(w) * float(w) + float(h) * float(h))));
+    cos_t /= hist_width;
+    sin_t /= hist_width;
+    for (int k = t; k < (D + 2) * (D + 2) * (N + 2); k += 64) hist_i[k] = 0;
+    barrier();
+    int side = 2 * radius + 1;
+    for (int k = t; k < side * side; k += 64) {
+        int i = k / side - radius, j = k % side - radius;
+        float c_rot = float(j) * cos_t - float(i) * sin_t;
+        float r_rot = float(j) * sin_t + float(i) * cos_t;
+        float rbin = r_rot + float(D / 2) - 0.5;
+        float cbin = c_rot + float(D / 2) - 0.5;
+        int y = pt.y + i, x = pt.x + j;
+        if (!(rbin > -1.0 && rbin < float(D) && cbin > -1.0 && cbin < float(D) && y > 0 && y < h - 1 &&
+              x > 0 && x < w - 1))
+            continue;
+        float dx = rd(layer, y * w + x + 1) - rd(layer, y * w + x - 1);
+        float dy = rd(layer, (y - 1) * w + x) - rd(layer, (y + 1) * w + x);
+        if (dx == 0.0 && dy == 0.0) continue;
+        float a = degrees(atan(dy, dx));
+        if (a < 0.0) a += 360.0;
+        float obin = (a - ori) * bins_per_rad;
+        float mag = sqrt(dx * dx + dy * dy) * exp((c_rot * c_rot + r_rot * r_rot) * exp_scale);
+        int r0 = int(floor(rbin)), c0 = int(floor(cbin)), o0 = int(floor(obin));
+        rbin -= float(r0);
+        cbin -= float(c0);
+        obin -= float(o0);
+        if (o0 < 0) o0 += N;
+        if (o0 >= N) o0 -= N;
+        float v_r1 = mag * rbin, v_r0 = mag - v_r1;
+        float v_rc11 = v_r1 * cbin, v_rc10 = v_r1 - v_rc11;
+        float v_rc01 = v_r0 * cbin, v_rc00 = v_r0 - v_rc01;
+        float v_rco111 = v_rc11 * obin, v_rco110 = v_rc11 - v_rco111;
+        float v_rco101 = v_rc10 * obin, v_rco100 = v_rc10 - v_rco101;
+        float v_rco011 = v_rc01 * obin, v_rco010 = v_rc01 - v_rco011;
+        float v_rco001 = v_rc00 * obin, v_rco000 = v_rc00 - v_rco001;
+        int idx = ((r0 + 1) * (D + 2) + c0 + 1) * (N + 2) + o0;
+        atomicAdd(hist_i[idx], int(roundEven(v_rco000 * FIX)));
+        atomicAdd(hist_i[idx + 1], int(roundEven(v_rco001 * FIX)));
+        atomicAdd(hist_i[idx + (N + 2)], int(roundEven(v_rco010 * FIX)));
+        atomicAdd(hist_i[idx + (N + 3)], int(roundEven(v_rco011 * FIX)));
+        atomicAdd(hist_i[idx + (D + 2) * (N + 2)], int(roundEven(v_rco100 * FIX)));
+        atomicAdd(hist_i[idx + (D + 2) * (N + 2) + 1], int(roundEven(v_rco101 * FIX)));
+        atomicAdd(hist_i[idx + (D + 3) * (N + 2)], int(roundEven(v_rco110 * FIX)));
+        atomicAdd(hist_i[idx + (D + 3) * (N + 2) + 1], int(roundEven(v_rco111 * FIX)));
+    }
+    barrier();
+    // circular orientation bins, then 4x4x8 layout
+    for (int k = t; k < D * D * N; k += 64) {
+        int cell = k / N, b = k % N;
+        int idx = (((cell / D) + 1) * (D + 2) + (cell % D) + 1) * (N + 2);
+        float v = float(hist_i[idx + b]);
+        if (b < 2) v += float(hist_i[idx + N + b]);
+        dsc[k] = v / FIX;
+    }
+    barrier();
+    if (t == 0) {
+        float s = 0.0;
+        for (int k = 0; k < D * D * N; k++) s += dsc[k] * dsc[k];
+        nrm = sqrt(s) * 0.2;  // SIFT_DESCR_MAG_THR
+    }
+    barrier();
+    for (int k = t; k < D * D * N; k += 64) dsc[k] = min(dsc[k], nrm);
+    barrier();
+    if (t == 0) {
+        float s = 0.0;
+        for (int k = 0; k < D * D * N; k++) s += dsc[k] * dsc[k];
+        nrm = 512.0 / max(sqrt(s), 1.1920929e-7);  // SIFT_INT_DESCR_FCTR
+    }
+    barrier();
+    int ob = kid * 128;
+    for (int k = t; k < D * D * N; k += 64) DSC.v[ob + k] = clamp(roundEven(dsc[k] * nrm), 0.0, 255.0);
+}

@@ -17,6 +17,14 @@ cpp/build/docscan ref.jpg right.jpg -o out --focal-px 3030            # 2 views:
 Library API (`src/docscan.hpp`): `cv::Mat docscan::process(images, options)`; throws
 `std::runtime_error` with a user-facing message. The CLI reads the focal length from EXIF
 (`FocalLengthIn35mmFilm`); in the app, pass `Options::focal_px` from the camera characteristics.
+For capture apps, `docscan::Session` splits the work: `add(photo)` does the per-photo part (page
+outline, SIFT, matching with photo 1) and returns a message if the photo is unusable; `finish()`
+does the rest. Photos that fail matching or the scale check are left out if at least 2 remain.
+
+GPU SIFT (`src/gpu_sift.cpp`, `src/shaders/`): Vulkan compute port of OpenCV's SIFT (same
+parameters, same tiles), used when the build finds Vulkan and `glslc`; falls back to OpenCV on
+any GPU error. `--no-gpu` or `DOCSCAN_GPU=0` disables it, `DOCSCAN_GPU=cpu` selects a software
+Vulkan device for testing.
 
 Layout: `common` (types, kd-tree, robust Levenberg-Marquardt), `camera` (triangulation, bundle
 adjustment with exact Jacobian), `matching` (page quad/outline, tiled SIFT, FLANN, essential

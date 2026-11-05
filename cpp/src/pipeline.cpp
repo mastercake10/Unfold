@@ -1,6 +1,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -49,6 +50,12 @@ Obs pick_views(const Obs& obs, const std::vector<size_t>& rows, int a, int b) {
     return o;
 }
 
+// some views could not be used; process() retries without them
+struct BadViews {
+    std::vector<int> views;
+    std::string first_error;
+};
+
 struct ViewMatch {
     std::vector<int> i0;
     Pts2 pr;
@@ -59,69 +66,102 @@ struct ViewMatch {
 
 }  // namespace
 
-cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
-    const int V = (int)images.size();
-    if (V < 2) fail("need at least two images");
-    if (V > 8) fail("at most 8 images");
-    const double W = opt.page_w, H = opt.page_h;
-    const double grid = opt.grid > 0 ? opt.grid : (V >= 3 ? 2.5 : 4.0);
-    const double smooth = opt.smooth > 0 ? opt.smooth : (V >= 3 ? 10.0 : 30.0);
-    for (auto& im : images)
-        if (im.empty() || im.size() != images[0].size() || im.type() != CV_8UC3)
-            fail("all images must be BGR photos from the same camera at the same resolution");
-    const int h = images[0].rows, w = images[0].cols;
-    const double s = std::min(1.0, (double)opt.max_side / std::max(h, w));
-    const double f_full = opt.focal_px > 0 ? opt.focal_px : 26.0 * std::hypot(w, h) / 43.27;
-    Cam cam{f_full * s, ((w - 1) / 2.0 + 0.5) * s - 0.5, ((h - 1) / 2.0 + 0.5) * s - 0.5};
-    const bool fixed_focal = opt.fixed_focal || V == 2;
-    std::vector<cv::Mat> imgs(V), gs(V);
-    for (int j = 0; j < V; j++) {
-        imgs[j] = images[j];
-        if (s < 1) cv::resize(images[j], imgs[j], cv::Size(), s, s, cv::INTER_AREA);
-        cv::cvtColor(imgs[j], gs[j], cv::COLOR_BGR2GRAY);
-    }
-    log(fmt("%d views, focal start %.1f px", V, f_full));
+// ---------------------------------------------------------------- per-photo analysis
 
-    log("page outlines ...");
-    std::vector<std::array<Vec2, 4>> quads(V);
-    std::vector<cv::Mat> masks(V);
-    for (int j = 0; j < V; j++) {
-        std::array<Vec2, 4> q;
-        cv::Mat m;
-        if (!find_page_quad(imgs[j], q, m)) {
-            if (j == 0) fail("could not find the page in the reference image");
-            continue;
-        }
-        quads[j] = refine_quad(gs[j], q);
-        masks[j] = m;
-    }
-    const auto quad = quads[0];
+struct ViewData {
+    cv::Mat gray;  // downscaled to max_side
+    cv::Mat mask;  // page mask (may be empty for views > 0)
+    ViewMatch m;   // views > 0: matches with the reference
+    size_t n_kp = 0;
+};
+
+using Clock = std::chrono::steady_clock;
+double secs(Clock::time_point& t) {  // seconds since t, and restart t
+    auto now = Clock::now();
+    double d = std::chrono::duration<double>(now - t).count();
+    t = now;
+    return d;
+}
+
+struct Session::Impl {
+    Options opt;
+    int w = 0, h = 0;
+    double s = 1, f_full = 0;
+    Cam cam{};
+    cv::Mat ref_full;  // reference photo at full size (rendered)
+    std::array<Vec2, 4> quad;
     cv::Mat mask_er;
-    cv::erode(masks[0], mask_er, cv::Mat::ones(15, 15, CV_8U));
-
-    // ---------------------------------------------------------------- matching
-    log("matching ...");
     Pts2 P0;
     cv::Mat d0;
-    sift_detect(gs[0], mask_er, opt.features, P0, d0);
-    std::vector<Pts2> kps(V);
-    std::vector<cv::Mat> descs(V);
-    for (int j = 1; j < V; j++) {
-        cv::Mat mj;
-        if (!masks[j].empty()) cv::dilate(masks[j], mj, cv::Mat::ones(41, 41, CV_8U));
-        sift_detect(gs[j], mj, opt.features, kps[j], descs[j]);
+    cv::Ptr<cv::flann::Index> index0;  // of d0, shared by all views
+    std::vector<ViewData> views;
+
+    void prepare(const cv::Mat& img, cv::Mat& small, cv::Mat& gray) const {
+        if (img.empty() || img.type() != CV_8UC3) fail("photos must be 8-bit colour images");
+        if (img.cols != w || img.rows != h) fail("all photos must have the same size");
+        small = img;
+        if (s < 1) cv::resize(img, small, cv::Size(), s, s, cv::INTER_AREA);
+        cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
     }
-    std::vector<ViewMatch> vm(V);
-    auto match_view = [&](int j) {
-        ViewMatch& r = vm[j];
+
+    void add_ref(const cv::Mat& img) {
+        auto t = Clock::now();
+        cv::Mat small;
+        ViewData v;
+        prepare(img, small, v.gray);
+        std::array<Vec2, 4> q;
+        if (!find_page_quad(small, q, v.mask)) fail("could not find the page in the first photo");
+        quad = refine_quad(v.gray, q);
+        cv::erode(v.mask, mask_er, cv::Mat::ones(15, 15, CV_8U));
+        double t_page = secs(t);
+        sift_detect(v.gray, mask_er, opt.features, P0, d0, opt.gpu);
+        double t_sift = secs(t);
+        cv::setRNGSeed(0);  // FLANN tree construction is random
+        index0 = flann_index(d0);
+        v.n_kp = P0.size();
+        ref_full = img;
+        views.push_back(std::move(v));
+        log(fmt("  photo 1: %zu keypoints", P0.size()));
+        log(fmt("    page %.2f s, features %.2f s, index %.2f s", t_page, t_sift, secs(t)));
+    }
+
+    // features of view j and its matches with the reference; r.error set if unusable
+    ViewData analyse(const cv::Mat& img, int j) const {
+        auto t = Clock::now();
+        cv::Mat small;
+        ViewData v;
+        prepare(img, small, v.gray);
+        std::array<Vec2, 4> q;
+        cv::Mat mj;
+        if (find_page_quad(small, q, v.mask)) cv::dilate(v.mask, mj, cv::Mat::ones(41, 41, CV_8U));
+        else v.mask.release();
+        small.release();
+        double t_page = secs(t);
+        Pts2 kps;
+        cv::Mat descs;
+        sift_detect(v.gray, mj, opt.features, kps, descs, opt.gpu);
+        double t_sift = secs(t);
+        v.n_kp = kps.size();
+        ViewMatch& r = v.m;
         cv::setRNGSeed(j);  // FLANN/MAGSAC randomness per view, independent of threading
         std::vector<int> i0;
         Pts2 pj;
-        match_ref(d0, kps[j], descs[j], i0, pj);
+        match_ref(d0, index0.get(), kps, descs, j, i0, pj);
         std::vector<Vec2> a(i0.size());
         for (size_t k = 0; k < i0.size(); k++) a[k] = P0[i0[k]];
+        // identical or unmoved photo: the essential matrix is degenerate and its pose meaningless
+        std::vector<double> disp(i0.size());
+        for (size_t k = 0; k < i0.size(); k++) disp[k] = (pj[k] - a[k]).norm();
+        double dmed = median(disp), diag = std::hypot(v.gray.cols, v.gray.rows);
+        if (!disp.empty() && dmed < 0.01 * diag) {
+            r.error = fmt("photo %d: the phone did not move since photo 1 (points moved %.0f px). Move the "
+                          "phone 10-20 cm between shots.", j + 1, dmed);
+            return v;
+        }
+        double t_match = secs(t);
         std::vector<char> inl;
         cv::Mat E = essential(a, pj, cam, 1.0, inl);
+        double t_pose = secs(t);
         Pts2 q0, qj;
         for (size_t k = 0; k < i0.size(); k++)
             if (inl[k]) {
@@ -131,43 +171,163 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
             }
         double cov = page_coverage(q0, mask_er);
         if (E.empty() || q0.size() < 8) {
-            r.error = fmt("view %d: no usable matches with the reference view", j);
-            return;
+            r.error = fmt("photo %d: does not match photo 1 (is the same page in view?)", j + 1);
+            return v;
         }
         recover_pose(E, q0, qj, cam, r.pose);
         double par = parallax_deg(q0, qj, r.pose.R, cam);
         if (par < 1.5) {
-            r.error = fmt("view %d: almost no viewpoint change between the photos (parallax %.2f deg). Move the "
-                          "phone 10-20 cm between shots, and check that two different images were passed.",
-                          j, par);
-            return;
+            r.error = fmt("photo %d: almost no viewpoint change since photo 1 (parallax %.2f deg). Move the "
+                          "phone 10-20 cm between shots instead of tilting it.", j + 1, par);
+            return v;
         }
         std::vector<Eigen::Matrix2d> A;
         Pts2 pred;
         local_affines(q0, qj, q0, A, pred, 12);
-        refine_subpixel(gs[0], gs[j], q0, qj, A, r.pr, r.ok, 15, 4);
+        refine_subpixel(views[0].gray, v.gray, q0, qj, A, r.pr, r.ok, 15, 4);
         int nok = 0;
         for (size_t k = 0; k < q0.size(); k++) nok += r.ok[k] = r.ok[k] && (r.pr[k] - qj[k]).norm() < 1.5;
-        r.msg = fmt("  view %d: %zu keypoints, %zu inliers, %d refined, page coverage %.2f%s", j, kps[j].size(),
-                    q0.size(), nok, cov, cov < 0.4 ? " (low: steep folds need tilt simulation, not ported)" : "");
-    };
+        r.msg = fmt("  photo %d: %zu keypoints, %zu inliers, %d refined, page coverage %.2f%s\n"
+                    "    page %.2f s, features %.2f s, matching %.2f s, pose %.2f s, refinement %.2f s",
+                    j + 1, kps.size(), q0.size(), nok, cov,
+                    cov < 0.4 ? " (low: steep folds need tilt simulation, not ported)" : "", t_page, t_sift,
+                    t_match, t_pose, secs(t));
+        return v;
+    }
+
+    cv::Mat solve(const std::vector<int>& vidx) const;  // indices into views
+};
+
+Session::Session(int width, int height, const Options& opt) : p(std::make_unique<Impl>()) {
+    p->opt = opt;
+    p->w = width;
+    p->h = height;
+    p->s = std::min(1.0, (double)opt.max_side / std::max(width, height));
+    p->f_full = opt.focal_px > 0 ? opt.focal_px : 26.0 * std::hypot(width, height) / 43.27;
+    const double s = p->s;
+    p->cam = Cam{p->f_full * s, ((width - 1) / 2.0 + 0.5) * s - 0.5, ((height - 1) / 2.0 + 0.5) * s - 0.5};
+}
+
+Session::~Session() = default;
+
+int Session::size() const { return (int)p->views.size(); }
+
+std::string Session::add(const cv::Mat& img) {
+    try {
+        if (p->views.empty()) {
+            p->add_ref(img);
+            return "";
+        }
+        if (p->views.size() >= 8) return "at most 8 photos";
+        ViewData v = p->analyse(img, (int)p->views.size());
+        if (!v.m.error.empty()) {
+            log("  " + v.m.error);
+            return v.m.error;
+        }
+        log(v.m.msg);
+        p->views.push_back(std::move(v));
+        return "";
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+}
+
+void Session::remove_last() {
+    if (p->views.empty()) return;
+    p->views.pop_back();
+    if (p->views.empty()) {
+        p->ref_full.release();
+        p->P0.clear();
+        p->index0.release();
+        p->d0.release();
+    }
+}
+
+cv::Mat Session::finish() {
+    std::vector<int> use;
+    for (int j = 0; j < size(); j++) use.push_back(j);
+    while (true) {
+        if (use.size() < 2) fail("need at least two usable photos");
+        try {
+            return p->solve(use);
+        } catch (const BadViews& b) {
+            if ((int)use.size() - (int)b.views.size() < 2) fail(b.first_error);
+            std::vector<int> keep;
+            std::string dropped;
+            for (size_t k = 0; k < use.size(); k++) {
+                if (std::find(b.views.begin(), b.views.end(), (int)k) == b.views.end()) keep.push_back(use[k]);
+                else dropped += fmt(" %d", use[k] + 1);
+            }
+            log("leaving out photo" + dropped + ", retrying with " + std::to_string(keep.size()) + " photos");
+            use.swap(keep);
+        }
+    }
+}
+
+cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
+    if (images.size() < 2) fail("need at least two images");
+    if (images.size() > 8) fail("at most 8 images");
+    Session S(images[0].cols, images[0].rows, opt);
+    log(fmt("%zu views, focal start %.1f px", images.size(), S.p->f_full));
+    log("matching ...");
+    std::string err = S.add(images[0]);
+    if (!err.empty()) fail(err);
+    // the other views in parallel, kept in input order
+    const int V = (int)images.size();
+    std::vector<ViewData> vd(V);
     {
         std::vector<std::thread> th;
-        for (int j = 1; j < V; j++) th.emplace_back(match_view, j);
+        for (int j = 1; j < V; j++)
+            th.emplace_back([&, j] {
+                try {
+                    vd[j] = S.p->analyse(images[j], j);
+                } catch (const std::exception& e) {
+                    vd[j].m.error = e.what();
+                }
+            });
         for (auto& t : th) t.join();
     }
+    std::string first_error;
+    for (int j = 1; j < V; j++) {
+        if (!vd[j].m.error.empty()) {
+            log("  " + vd[j].m.error + " -> leaving it out");
+            if (first_error.empty()) first_error = vd[j].m.error;
+            continue;
+        }
+        log(vd[j].m.msg);
+        S.p->views.push_back(std::move(vd[j]));
+    }
+    if (S.size() < 2) fail(first_error);
+    return S.finish();
+}
+
+// ---------------------------------------------------------------- 3D, unrolling, rendering
+
+cv::Mat Session::Impl::solve(const std::vector<int>& vidx) const {
+    const int V = (int)vidx.size();
+    const double W = opt.page_w, H = opt.page_h;
+    const double grid = opt.grid > 0 ? opt.grid : (V >= 3 ? 2.5 : 4.0);
+    const double smooth = opt.smooth > 0 ? opt.smooth : (V >= 3 ? 10.0 : 30.0);
+    const bool fixed_focal = opt.fixed_focal || V == 2;
+    Cam cam = this->cam;
+    std::vector<cv::Mat> gs(V), masks(V);
+    std::vector<const ViewMatch*> vmp(V, nullptr);
+    for (int k = 0; k < V; k++) {
+        gs[k] = views[vidx[k]].gray;
+        masks[k] = views[vidx[k]].mask;
+        if (k > 0) vmp[k] = &views[vidx[k]].m;
+    }
+    auto vm = [&](int j) -> const ViewMatch& { return *vmp[j]; };
+    log(fmt("%d photos: 3D ...", V));
+
     std::vector<Pose> poses(V);
     Obs obs(P0.size(), V);
     for (size_t i = 0; i < P0.size(); i++) obs.at(i, 0) = P0[i];
     for (int j = 1; j < V; j++) {
-        if (!vm[j].error.empty()) fail(vm[j].error);
-        for (size_t k = 0; k < vm[j].i0.size(); k++)
-            if (vm[j].ok[k]) obs.at(vm[j].i0[k], j) = vm[j].pr[k];
-        poses[j] = vm[j].pose;
-        log(vm[j].msg);
+        for (size_t k = 0; k < vm(j).i0.size(); k++)
+            if (vm(j).ok[k]) obs.at(vm(j).i0[k], j) = vm(j).pr[k];
+        poses[j] = vm(j).pose;
     }
-    kps.clear();
-    descs.clear();
     {
         std::vector<size_t> keep;
         for (size_t i = 0; i < obs.n(); i++)
@@ -197,7 +357,10 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
                 auto [nn, d] = tree1.nearest(o.at(k, 0));
                 if (d < 15) ratio.push_back(X1[nn].z() / Xj[k].z());
             }
-            if (ratio.size() < 20) fail(fmt("view %d overlaps too little with view 1", j));
+            if (ratio.size() < 20) {
+                log(fmt("  photo %d overlaps too little with photo 2", vidx[j] + 1));
+                throw BadViews{{j}, fmt("photo %d overlaps too little with photo 2", vidx[j] + 1)};
+            }
             poses[j].t *= median(ratio);
         }
     }
@@ -234,6 +397,19 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
     Pts3 uvz = to_page(F, X);
     auto bnd = grid_bounds(uv_of(uvz), W, H);
 
+    // page outline in all photos (image processing only), alongside the densification
+    Pts2 out0;
+    std::vector<Pts2> outs(V);
+    Thread outline_thread([&] {
+        Pts2 o;
+        std::vector<char> ok;
+        page_outline(gs[0], masks[0], o, ok);
+        for (size_t i = 0; i < o.size(); i++)
+            if (ok[i]) out0.push_back(o[i]);
+        for (int j = 1; j < V; j++)
+            if (!masks[j].empty()) page_outline(gs[j], masks[j], outs[j], ok);
+    });
+
     // ---------------------------------------------------------------- densification
     log("densifying ...");
     {
@@ -269,27 +445,14 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
     }
 
     // ---------------------------------------------------------------- page outline
-    Pts2 out0;
+    outline_thread.join();
     std::vector<int> side;
-    {
-        Pts2 o;
-        std::vector<char> ok;
-        page_outline(gs[0], masks[0], o, ok);
-        for (size_t i = 0; i < o.size(); i++)
-            if (ok[i]) out0.push_back(o[i]);
-        for (int e : assign_edges(out0, quad)) side.push_back(e >= 0 ? F.edge_map[e] : -1);
-    }
+    for (int e : assign_edges(out0, quad)) side.push_back(e >= 0 ? F.edge_map[e] : -1);
     Pts3 Xb;
     std::vector<int> bside;
     std::vector<size_t> bidx;
     {
         log("outline ...");
-        std::vector<Pts2> outs(V);
-        for (int j = 1; j < V; j++)
-            if (!masks[j].empty()) {
-                std::vector<char> ok;
-                page_outline(gs[j], masks[j], outs[j], ok);
-            }
         Surface S0 = fit_heightfield(uvz, bnd, 2 * grid, smooth);
         Pts3 Xp;
         std::vector<char> hitp;
@@ -359,7 +522,6 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
                 cnt[2], cnt[3], out0.size()));
     }
     // from here on only the reference photo is needed
-    imgs.clear();
     gs.clear();
     masks.clear();
 
@@ -405,11 +567,16 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
     for (int it = 0; it < 2; it++) {
         log(fmt("height field + flattening (pass %d), grid u %.0f..%.0f v %.0f..%.0f mm ...", it + 1, bnd[0], bnd[1],
                 bnd[2], bnd[3]));
-        S = fit_heightfield(all_data(), bnd, grid, smooth, ruling_w);
+        auto tp = Clock::now();
+        S = fit_heightfield(all_data(), bnd, it == 0 ? 2 * grid : grid, smooth, ruling_w);  // pass 1 only sets the scale
+        double t_h = secs(tp);
         double smed, smax;
         st = flatten_grid(S, smed, smax);
+        double t_f = secs(tp);
         Pts3 Xo;
         ray_surface(out0, cam, F, S, c, n, Xo, hit);
+        log(fmt("    grid %dx%d: height field %.2f s, flattening %.2f s, rays %.2f s", S.g.nu, S.g.nv, t_h, t_f,
+                secs(tp)));
         for (size_t k = 0; k < bidx.size(); k++) {
             Xo[bidx[k]] = Xb[k];  // where the outline was triangulated, its 3D is measured
             hit[bidx[k]] = 1;
@@ -573,7 +740,7 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
         for (int it = 0; it < 2; it++) {
             cv::Mat ur, vr;
             flat_to_uv(st, S.g, W, H, 0.5, ur, vr);
-            Render R = render_flat(images[0], camf, F, S, ur, vr, 0.5, W, H, 150);
+            Render R = render_flat(ref_full, camf, F, S, ur, vr, 0.5, W, H, 150);
             std::vector<Eigen::Vector4d> segs;
             std::vector<char> hz;
             detect_lines(gray_u8(R.img, R.page), W, H, segs, hz);
@@ -612,12 +779,17 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
 
     // ---------------------------------------------------------------- render
     log("rendering ...");
+    auto t = Clock::now();
     cv::Mat ur, vr;
     flat_to_uv(st, S.g, W, H, 0.5, ur, vr);
-    Render R = render_flat(images[0], camf, F, S, ur, vr, 0.5, W, H, opt.dpi);
+    Render R = render_flat(ref_full, camf, F, S, ur, vr, 0.5, W, H, opt.dpi);
+    double t_render = secs(t);
     cv::Mat valid = R.valid & R.page;
     cv::Mat alb = remove_shading(R.img, valid, R.nu, R.nv);
-    return clean_paper(to_uint8(alb));
+    double t_shading = secs(t);
+    cv::Mat out = clean_paper(to_uint8(alb));
+    log(fmt("  warp %.2f s, shading %.2f s, paper %.2f s", t_render, t_shading, secs(t)));
+    return out;
 }
 
 }  // namespace docscan
