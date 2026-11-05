@@ -4,3 +4,4 @@ test/out
 test/real
 test/synth
 __pycache__
+cpp/build/
