@@ -606,8 +606,62 @@ Vec2 Disp::operator()(const Vec2& q) const {
 //   lines:   all samples of a segment share one cross-axis coordinate (left free)
 //   anchors: points that should stay put
 // plus second-difference smoothness.
+std::vector<Pts2> detect_text_lines(const cv::Mat& g8, double W, double H) {
+    const double sc = W / g8.cols, bin = 3.0, border = 4.0;
+    const int px = std::max(1, (int)std::lround(1.0 / sc));  // pixels per mm
+    cv::Mat ink, blob;
+    cv::adaptiveThreshold(g8, ink, 255, cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY_INV, 15 * px | 1, 12);
+    // letters and words of one line merge, lines stay apart
+    cv::morphologyEx(ink, blob, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(4 * px, 1)));
+    cv::Mat lab, stats, cent;
+    int n = cv::connectedComponentsWithStats(blob, lab, stats, cent, 8, CV_32S);
+    std::vector<Pts2> lines;
+    for (int k = 1; k < n; k++) {
+        int x0 = stats.at<int>(k, cv::CC_STAT_LEFT), y0 = stats.at<int>(k, cv::CC_STAT_TOP);
+        int w = stats.at<int>(k, cv::CC_STAT_WIDTH), h = stats.at<int>(k, cv::CC_STAT_HEIGHT);
+        if (w * sc < 30 || h * sc > 7 || h * sc < 1) continue;
+        // ink centre per column bin
+        int nb = (int)(w * sc / bin);
+        Pts2 pts;
+        for (int b = 0; b < nb; b++) {
+            int xa = x0 + (int)(b * bin / sc), xb = std::min(x0 + w, x0 + (int)((b + 1) * bin / sc));
+            double sy = 0;
+            int cnt = 0;
+            for (int y = y0; y < y0 + h; y++) {
+                const int* l = lab.ptr<int>(y);
+                const uchar* q = ink.ptr<uchar>(y);
+                for (int x = xa; x < xb; x++)
+                    if (l[x] == k && q[x]) sy += y, cnt++;
+            }
+            if (cnt < 3 * px) continue;  // gap between words
+            Vec2 P((xa + xb) / 2.0 * sc, (sy / cnt + 0.5) * sc);
+            if (P.x() > border && P.x() < W - border && P.y() > border && P.y() < H - border) pts.push_back(P);
+        }
+        if (pts.size() < 8) continue;
+        // drop bins off a smooth curve (descenders, touching neighbours)
+        std::vector<char> ok(pts.size(), 1);
+        for (int pass = 0; pass < 2; pass++) {
+            std::vector<double> xs, ys;
+            for (size_t i = 0; i < pts.size(); i++)
+                if (ok[i]) xs.push_back(pts[i].x()), ys.push_back(pts[i].y());
+            if (xs.size() < 8) break;
+            auto cf = polyfit(xs, ys, 2);
+            for (size_t i = 0; i < pts.size(); i++) ok[i] = std::abs(pts[i].y() - polyval(cf, pts[i].x())) < 0.6;
+        }
+        Pts2 keep;
+        for (size_t i = 0; i < pts.size(); i++)
+            if (ok[i]) keep.push_back(pts[i]);
+        if (keep.size() < 8 || keep.back().x() - keep.front().x() < 30) continue;
+        double slope = (keep.back().y() - keep.front().y()) / (keep.back().x() - keep.front().x());
+        if (std::abs(slope) > 0.05) continue;
+        lines.push_back(keep);
+    }
+    return lines;
+}
+
 Disp fit_correction(double W, double H, const std::vector<EdgeTerm>& edges, const std::vector<Eigen::Vector4d>& segs,
-                    const std::vector<char>& horiz, const Pts2& anchors, double w_anchor) {
+                    const std::vector<char>& horiz, const Pts2& anchors, double w_anchor,
+                    const std::vector<Pts2>& curves) {
     const double step = 4.0, lam = 30.0, w_edge = 1.0, w_line = 1.0;
     Disp D;
     D.step = step;
@@ -675,6 +729,21 @@ Disp fit_correction(double W, double H, const std::vector<EdgeTerm>& edges, cons
             }
             n_c++;
         }
+        // text lines: all points of one line get the same t
+        if (axis == 1)
+            for (auto& cv : curves) {
+                int n = (int)cv.size();
+                double w = w_line / std::sqrt(n / 10.0 + 1);
+                for (auto& P : cv) {
+                    int c[5];
+                    double v[5];
+                    bil(P, c, v);
+                    c[4] = N + n_c;
+                    v[4] = -1;
+                    add_row(c, v, 5, w, -P[1]);
+                }
+                n_c++;
+            }
         for (auto& p : anchors) {
             int c[4];
             double v[4];

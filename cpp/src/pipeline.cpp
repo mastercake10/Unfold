@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -646,6 +647,8 @@ cv::Mat Session::Impl::correct_render(Flat& fl) const {
     const std::vector<size_t>& cidx = fl.cidx;
     const Pts3& uvz = fl.uvz;
     const std::vector<double>& rres = fl.rres;
+    const char* tl_env = std::getenv("DOCSCAN_TEXTLINES");  // testing: 0 turns text lines off
+    const bool text_lines = !tl_env || std::string(tl_env) != "0";
 
     // ---------------------------------------------------------------- edge and line correction
     const Cam camf{cam.f / s, (cam.cx + 0.5) / s - 0.5, (cam.cy + 0.5) / s - 0.5};
@@ -784,13 +787,20 @@ cv::Mat Session::Impl::correct_render(Flat& fl) const {
             Render R = render_flat(ref_full, camf, F, S, ur, vr, 0.5, W, H, 150);
             std::vector<Eigen::Vector4d> segs;
             std::vector<char> hz;
-            detect_lines(gray_u8(R.img, R.page), W, H, segs, hz);
-            if (have)
+            cv::Mat g8 = gray_u8(R.img, R.page);
+            detect_lines(g8, W, H, segs, hz);
+            std::vector<Pts2> text;
+            if (text_lines) text = detect_text_lines(g8, W, H);
+            if (have) {
                 for (auto& sg : segs) {
                     Vec2 a = sg.head<2>(), b = sg.tail<2>();
                     sg << a - dl(a), b - dl(b);
                 }
-            dl = fit_correction(W, H, hold, segs, hz, anchors, opt.anchor_w);
+                for (auto& tl : text)
+                    for (auto& P : tl) P -= dl(P);
+            }
+            dl = fit_correction(W, H, hold, segs, hz, anchors, opt.anchor_w, text);
+            if (text_lines) log(fmt("    %zu text lines", text.size()));
             have = true;
             std::vector<double> dd;
             for (size_t i = 0; i < st.size(); i++) {

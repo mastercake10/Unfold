@@ -82,7 +82,11 @@ struct Disp {
     Vec2 operator()(const Vec2& q) const;
 };
 Disp fit_correction(double W, double H, const std::vector<EdgeTerm>& edges, const std::vector<Eigen::Vector4d>& segs,
-                    const std::vector<char>& horiz, const Pts2& anchors, double w_anchor);
+                    const std::vector<char>& horiz, const Pts2& anchors, double w_anchor,
+                    const std::vector<Pts2>& curves = {});
+// Text lines (and other long horizontal ink structures) as polylines in mm: centre of the ink
+// per 3 mm column, for straightening across folds where a single view has no 3D.
+std::vector<Pts2> detect_text_lines(const cv::Mat& g8, double W, double H);
 
 // ------------------------------------------------------------ rendering (render.cpp)
 struct Render {
