@@ -65,6 +65,17 @@ as single-channel PNG. On the 5 samples: 4.6 MB → ~0.6 MB per page, edge sharp
 `eval_real.py` (CLAHE + SIFT) reacts to image tone, so its numbers move by up to ~0.02 mm
 median / ~0.15 mm p95 per sample on identical geometry. Compare geometry with `--no-clean`.
 
+## Speed and memory
+
+Per-view matching and densification run in threads (`--threads`, default: all cores; OpenCV and
+large numpy ops release the GIL). SIFT is detected in overlapping tiles (OpenCV upsamples the
+image 2× internally, ~2 GB on a full photo otherwise), rendering works in row strips, and only
+the views that are still needed are kept in memory. `--minimal` skips the debug outputs (`points.ply`,
+`heightfield.png`, `overlay.jpg`, `flat_raw.png`).
+
+On the 5 samples (4 views, 16 threads): 124 s → 84 s total (~15–19 s per page), peak memory
+2.35 GB → ~1.1 GB. 2 views: 57 s → 52 s.
+
 ## Real-photo results (Pixel 8, 5 folded letters, vs. flatbed scan)
 
 `test/batch_real.sh` runs all samples and compares the output with the scans (`test/eval_real.py`).

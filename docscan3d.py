@@ -13,6 +13,8 @@ import argparse
 import json
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -24,6 +26,25 @@ from scipy.sparse.linalg import spsolve
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+def limit_malloc_arenas(n=2):
+    """glibc keeps a separate heap per thread and holds on to freed memory; with worker
+    threads that inflated peak memory by ~0.5 GB. No-op elsewhere."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").mallopt(-8, n)  # M_ARENA_MAX
+    except (OSError, AttributeError):
+        pass
+
+
+def run_parallel(fn, items, threads):
+    """fn over items in threads (OpenCV and large numpy ops release the GIL); results in order."""
+    items = list(items)
+    if threads <= 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(min(threads, len(items))) as ex:
+        return list(ex.map(fn, items))
 
 
 # ---------------------------------------------------------------- camera
@@ -156,48 +177,75 @@ def refine_quad(gray, quad, half=25, n=40):
 
 # ---------------------------------------------------------------- matching
 
-def refine_subpixel(g1, g2, p1, p2, H_local=None, win=15, search=4):
+def refine_subpixel(g1, g2, p1, p2, H_local=None, win=15, search=4, chunk=1024):
     """NCC template matching of img1 patches (pre-warped by the local affine A)
-    in a +-search window around p2, with parabolic subpixel peak."""
+    in a +-search window around p2, with parabolic subpixel peak. Vectorized over
+    points; same result as per-point cv2.matchTemplate(TM_CCOEFF_NORMED)."""
+    from scipy.ndimage import map_coordinates
     out = p2.copy()
-    ok = np.ones(len(p1), bool)
     r = win // 2
+    S_ = win + 2 * search
     h1, w1 = g1.shape
     h2, w2 = g2.shape
+    x1, y1 = p1[:, 0], p1[:, 1]
+    x2, y2 = p2[:, 0], p2[:, 1]
+    ok = ((r + 1 <= x1) & (x1 < w1 - r - 1) & (r + 1 <= y1) & (y1 < h1 - r - 1) &
+          (r + search + 1 <= x2) & (x2 < w2 - r - search - 1) & (r + search + 1 <= y2) & (y2 < h2 - r - search - 1))
     g1f = g1.astype(np.float32)
     g2f = g2.astype(np.float32)
-    for i, (a, b) in enumerate(zip(p1, p2)):
-        x1, y1 = a
-        x2, y2 = b
-        if not (r + 1 <= x1 < w1 - r - 1 and r + 1 <= y1 < h1 - r - 1 and
-                r + search + 1 <= x2 < w2 - r - search - 1 and r + search + 1 <= y2 < h2 - r - search - 1):
-            ok[i] = False
+    ot = np.arange(win, dtype=np.float64) - r
+    orr = np.arange(S_, dtype=np.float64) - (S_ - 1) / 2
+    for c0 in range(0, len(p1), chunk):
+        ii = np.nonzero(ok[c0:c0 + chunk])[0] + c0
+        if not len(ii):
             continue
+        n = len(ii)
+        # template: img1 at x1 + A^-1 (o), o = template offset in img2 geometry
+        dx, dy = np.meshgrid(ot, ot)
         if H_local is not None:
-            A = H_local[i]
-            M = np.hstack([A, (np.array([x2, y2]) - A @ np.array([x1, y1]))[:, None]])
-            # template = patch of img1 mapped into img2 geometry around (x2, y2)
-            Minv = cv2.invertAffineTransform(M)
-            T = np.float32([[1, 0, x2 - r], [0, 1, y2 - r]])
-            full = np.vstack([Minv, [0, 0, 1]]) @ np.vstack([T, [0, 0, 1]])
-            tpl = cv2.warpAffine(g1f, full[:2], (win, win), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+            Ai = np.linalg.inv(H_local[ii])
+            tx = x1[ii, None, None] + Ai[:, 0, 0, None, None] * dx + Ai[:, 0, 1, None, None] * dy
+            ty = y1[ii, None, None] + Ai[:, 1, 0, None, None] * dx + Ai[:, 1, 1, None, None] * dy
+            tpl = cv2.remap(g1f, tx.reshape(n, -1).astype(np.float32), ty.reshape(n, -1).astype(np.float32),
+                            cv2.INTER_LINEAR).reshape(n, win, win)
         else:
-            tpl = cv2.getRectSubPix(g1f, (win, win), (x1, y1))
-        reg = cv2.getRectSubPix(g2f, (win + 2 * search, win + 2 * search), (x2, y2))
-        if tpl.std() < 4:
-            ok[i] = False
-            continue
-        res = cv2.matchTemplate(reg, tpl, cv2.TM_CCOEFF_NORMED)
-        _, mx, _, (cx, cy) = cv2.minMaxLoc(res)
-        if mx < 0.85 or not (0 < cx < res.shape[1] - 1 and 0 < cy < res.shape[0] - 1):
-            ok[i] = False
-            continue
+            tx = x1[ii, None, None] + dx
+            ty = y1[ii, None, None] + dy
+            tpl = map_coordinates(g1f, [ty.ravel(), tx.ravel()], order=1).reshape(n, win, win)
+        rx, ry = np.meshgrid(orr, orr)
+        reg = map_coordinates(g2f, [(y2[ii, None, None] + ry).ravel(), (x2[ii, None, None] + rx).ravel()],
+                              order=1).reshape(n, S_, S_).astype(np.float32)
+        tpl = tpl.astype(np.float32)
+        flat = tpl.std(axis=(1, 2)) < 4
+        T = tpl - tpl.mean(axis=(1, 2), keepdims=True)
+        tn2 = (T * T).sum(axis=(1, 2), dtype=np.float64)
+        # window sums via integral images
+        reg64 = reg.astype(np.float64)
+        ci = np.zeros((n, S_ + 1, S_ + 1)); ci[:, 1:, 1:] = reg64.cumsum(1).cumsum(2)
+        ci2 = np.zeros((n, S_ + 1, S_ + 1)); ci2[:, 1:, 1:] = (reg64 * reg64).cumsum(1).cumsum(2)
+        box = lambda c: c[:, win:, win:] - c[:, :-win, win:] - c[:, win:, :-win] + c[:, :-win, :-win]
+        wsum, wsq = box(ci), box(ci2)
+        wvar = np.maximum(wsq - wsum * wsum / (win * win), 0)
+        K = 2 * search + 1
+        num = np.empty((n, K, K), np.float32)
+        for oy in range(K):
+            for ox in range(K):
+                num[:, oy, ox] = np.einsum("nij,nij->n", reg[:, oy:oy + win, ox:ox + win], T)
+        res = num / np.sqrt(np.maximum(wvar * tn2[:, None, None], 1e-12))
+        flat_idx = res.reshape(n, -1).argmax(1)
+        cy, cx = np.divmod(flat_idx, K)
+        mx = res.reshape(n, -1)[np.arange(n), flat_idx]
+        good = ~flat & (mx >= 0.85) & (cx > 0) & (cx < K - 1) & (cy > 0) & (cy < K - 1)
+        cxc, cyc = np.clip(cx, 1, K - 2), np.clip(cy, 1, K - 2)
+        nn = np.arange(n)
+
         def para(l, c, rr):
             d = l - 2 * c + rr
-            return 0.0 if abs(d) < 1e-9 else 0.5 * (l - rr) / d
-        dx = para(res[cy, cx - 1], res[cy, cx], res[cy, cx + 1])
-        dy = para(res[cy - 1, cx], res[cy, cx], res[cy + 1, cx])
-        out[i] = (x2 - search + cx + dx, y2 - search + cy + dy)
+            return np.where(np.abs(d) < 1e-9, 0.0, 0.5 * (l - rr) / np.where(np.abs(d) < 1e-9, 1.0, d))
+        sx = para(res[nn, cyc, cxc - 1], res[nn, cyc, cxc], res[nn, cyc, cxc + 1])
+        sy = para(res[nn, cyc - 1, cxc], res[nn, cyc, cxc], res[nn, cyc + 1, cxc])
+        out[ii] = np.c_[x2[ii] - search + cx + sx, y2[ii] - search + cy + sy]
+        ok[ii] = good
     return out, ok
 
 
@@ -208,13 +256,13 @@ def local_affines(p1, p2, q=None, k=12):
     q = p1 if q is None else q
     tree = cKDTree(p1)
     _, idx = tree.query(q, k=min(k, len(p1)))
-    A = np.empty((len(q), 2, 2))
-    pred = np.empty((len(q), 2))
-    for i, nb in enumerate(idx):
-        m1, m2 = p1[nb].mean(0), p2[nb].mean(0)
-        sol, *_ = np.linalg.lstsq(p1[nb] - m1, p2[nb] - m2, rcond=None)
-        A[i] = sol.T
-        pred[i] = m2 + A[i] @ (q[i] - m1)
+    P1, P2 = p1[idx], p2[idx]
+    m1, m2 = P1.mean(1), P2.mean(1)
+    D1, D2 = P1 - m1[:, None], P2 - m2[:, None]
+    # batched least squares: sol = pinv(D1) D2 (pinv also covers collinear neighbours, like lstsq)
+    sol = np.linalg.pinv(D1) @ D2
+    A = np.transpose(sol, (0, 2, 1))
+    pred = m2 + np.einsum("nij,nj->ni", A, q - m1)
     return A, pred
 
 
@@ -241,6 +289,8 @@ def norm_to_px(xn, cam):
 
 
 def px_to_norm(px, cam):
+    if cam["k1"] == 0 and cam["k2"] == 0:
+        return np.c_[(px[:, 0] - cam["cx"]) / cam["f"], (px[:, 1] - cam["cy"]) / cam["f"]]
     return cv2.undistortPoints(px.reshape(-1, 1, 2).astype(np.float64), cam_K(cam), cam_dist(cam),
                                criteria=(cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 40, 1e-10)).reshape(-1, 2)
 
@@ -259,20 +309,25 @@ def rodrigues(r):
 
 
 def triangulate_multi(obs, Rs, ts, cam):
-    """N-view DLT. obs: (N, V, 2) pixels with NaN for missing observations."""
+    """Linear least-squares N-view triangulation. obs: (N, V, 2) pixels, NaN = missing.
+    Each observation gives two rows a.X = -c of the DLT system; the 3x3 normal equations
+    are solved for all points at once (much cheaper than an SVD per point)."""
     N, V, _ = obs.shape
-    A = np.zeros((N, 2 * V, 4))
+    M = np.zeros((N, 3, 3))
+    rhs = np.zeros((N, 3))
     for v in range(V):
         ok = np.isfinite(obs[:, v, 0])
         if not ok.any():
             continue
         xn = px_to_norm(obs[ok, v], cam)
         P = np.hstack([Rs[v], ts[v].reshape(3, 1)])
-        A[ok, 2 * v] = xn[:, 0:1] * P[2] - P[0]
-        A[ok, 2 * v + 1] = xn[:, 1:2] * P[2] - P[1]
-    _, _, vt = np.linalg.svd(A)
-    Xh = vt[:, -1]
-    return Xh[:, :3] / Xh[:, 3:4]
+        for row in (xn[:, 0:1] * P[2] - P[0], xn[:, 1:2] * P[2] - P[1]):
+            a, c = row[:, :3], row[:, 3]
+            M[ok] += a[:, :, None] * a[:, None, :]
+            rhs[ok] -= a * c[:, None]
+    # tiny ridge keeps points seen in one view only from making the batch singular
+    M += (1e-12 * np.trace(M, axis1=1, axis2=2) + 1e-300)[:, None, None] * np.eye(3)
+    return np.linalg.solve(M, rhs[..., None])[..., 0]
 
 
 def reproj_errors(X, obs, Rs, ts, cam):
@@ -805,7 +860,19 @@ def flatten_grid(gu, gv, Z, support=None):
     rows = np.r_[np.repeat(np.arange(m), 4), m + np.arange(n2)]
     cols = np.r_[np.stack([2 * E[:, 0], 2 * E[:, 0] + 1, 2 * E[:, 1], 2 * E[:, 1] + 1], 1).ravel(), np.arange(n2)]
     S = sparse.csr_matrix((np.ones(len(rows), int), (rows, cols)), shape=(m + n2, n2))
-    res = least_squares(resid, x0, jac_sparsity=S, method="trf", x_scale=1.0, max_nfev=200)
+    rows_j = np.repeat(np.arange(m), 4)
+    cols_j = np.stack([2 * E[:, 0], 2 * E[:, 0] + 1, 2 * E[:, 1], 2 * E[:, 1] + 1], 1).ravel()
+
+    def jac(x):
+        q = x.reshape(-1, 2)
+        dvec = q[E[:, 0]] - q[E[:, 1]]
+        d = np.linalg.norm(dvec, axis=1)
+        g = we[:, None] * dvec / np.maximum(d, 1e-12)[:, None]
+        vals = np.c_[g, -g].ravel()
+        Jd = sparse.csr_matrix((vals, (rows_j, cols_j)), shape=(m, n2))
+        return sparse.vstack([Jd, sparse.identity(n2, format="csr") * anchor], format="csr")
+
+    res = least_squares(resid, x0, jac=jac, method="trf", x_scale=1.0, max_nfev=200, tr_solver="lsmr")
     st = res.x.reshape(nv_, nu_, 2)
     strain = np.abs(resid(res.x)[:m]) / we / L
     return st, float(np.median(strain)), float(strain.max())
@@ -860,34 +927,49 @@ def save_heightmap_png(path, gu, gv, Z, uvz, W, H):
 
 # ---------------------------------------------------------------- photometric
 
-def flat_geometry(cam, F, gu, gv, Z, W, H, dpi, inv):
-    """For every output pixel: 3D point (reference frame), page-frame normal, page mask."""
+def flat_geometry(cam, F, gu, gv, Z, W, H, dpi, inv, rows=256):
+    """For every output pixel: 3D point (reference frame, float32), page-frame normal, page
+    mask. Computed in row strips so the float64 temporaries stay small."""
     ppm = dpi / 25.4
     ow, oh = int(round(W * ppm)), int(round(H * ppm))
     u_r, v_r, res_mm = inv
     sx = ((np.arange(ow) + 0.5) / ppm / res_mm).astype(np.float32)
-    sy = ((np.arange(oh) + 0.5) / ppm / res_mm).astype(np.float32)
-    MX, MY = np.meshgrid(sx, sy)
-    U = cv2.remap(u_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    V = cv2.remap(v_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    page = np.isfinite(U) & np.isfinite(V)
-    U[~page], V[~page] = -1e4, -1e4
-    Zs = sample_heightfield(gu, gv, Z, U.ravel(), V.ravel())
-    X = from_page(F, np.c_[U.ravel(), V.ravel(), Zs])
     step = gu[1] - gu[0]
     zv, zu = np.gradient(Z, step)
-    nu = -sample_heightfield(gu, gv, zu, U.ravel(), V.ravel()).reshape(oh, ow)
-    nv = -sample_heightfield(gu, gv, zv, U.ravel(), V.ravel()).reshape(oh, ow)
+    X = np.empty((oh * ow, 3), np.float32)
+    nu = np.empty((oh, ow), np.float32)
+    nv = np.empty((oh, ow), np.float32)
+    page = np.empty((oh, ow), bool)
+    for r0 in range(0, oh, rows):
+        r1 = min(r0 + rows, oh)
+        sy = ((np.arange(r0, r1) + 0.5) / ppm / res_mm).astype(np.float32)
+        MX, MY = np.meshgrid(sx, sy)
+        U = cv2.remap(u_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        V = cv2.remap(v_r, MX, MY, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        pg = np.isfinite(U) & np.isfinite(V)
+        U[~pg], V[~pg] = -1e4, -1e4
+        Uf, Vf = U.ravel().astype(np.float64), V.ravel().astype(np.float64)
+        Zs = sample_heightfield(gu, gv, Z, Uf, Vf)
+        X[r0 * ow:r1 * ow] = from_page(F, np.c_[Uf, Vf, Zs])
+        nu[r0:r1] = -sample_heightfield(gu, gv, zu, Uf, Vf).reshape(r1 - r0, ow)
+        nv[r0:r1] = -sample_heightfield(gu, gv, zv, Uf, Vf).reshape(r1 - r0, ow)
+        page[r0:r1] = pg
     return X, (oh, ow), nu, nv, page
 
 
-def render_view(img, X, shape, cam, R, t):
+def render_view(img, X, shape, cam, R, t, rows=256):
     oh, ow = shape
-    px, z = project(X, R, t, cam)
-    mx = px[:, 0].reshape(oh, ow).astype(np.float32)
-    my = px[:, 1].reshape(oh, ow).astype(np.float32)
+    mx = np.empty((oh, ow), np.float32)
+    my = np.empty((oh, ow), np.float32)
+    zpos = np.empty((oh, ow), bool)
+    for r0 in range(0, oh, rows):
+        r1 = min(r0 + rows, oh)
+        px, z = project(X[r0 * ow:r1 * ow].astype(np.float64), R, t, cam)
+        mx[r0:r1] = px[:, 0].reshape(r1 - r0, ow)
+        my[r0:r1] = px[:, 1].reshape(r1 - r0, ow)
+        zpos[r0:r1] = z.reshape(r1 - r0, ow) > 0
     h, w = img.shape[:2]
-    valid = (z.reshape(oh, ow) > 0) & (mx >= 2) & (my >= 2) & (mx < w - 3) & (my < h - 3)
+    valid = zpos & (mx >= 2) & (my >= 2) & (mx < w - 3) & (my < h - 3)
     out = cv2.remap(img, mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
     # detail captured per output pixel: photo pixels per output pixel (area ratio)
     gxx, gxy = np.gradient(mx, axis=1), np.gradient(mx, axis=0)
@@ -902,7 +984,7 @@ def remove_shading(img, valid, nu, nv, sub=4):
     envelope (ink and printed areas are darker and get down-weighted), then a
     medium-scale residual correction catches what the model misses."""
     oh, ow = valid.shape
-    L = np.log(np.clip(img.mean(2), 1.0, None))
+    L = np.log(np.clip(img.mean(2, dtype=np.float32), 1.0, None))
     ys, xs = np.mgrid[0:oh:sub, 0:ow:sub]
     m = valid[ys, xs]
     ys, xs = ys[m], xs[m]
@@ -915,7 +997,7 @@ def remove_shading(img, valid, nu, nv, sub=4):
                          a, b, a * a, b * b, a * b], -1)
 
     Phi = feats(s, t, a, b)
-    y = L[ys, xs]
+    y = L[ys, xs].astype(np.float64)
     w = np.ones(len(y))
     beta = np.zeros(Phi.shape[1])
     for it in range(12):
@@ -944,12 +1026,13 @@ def remove_shading(img, valid, nu, nv, sub=4):
     den2 = cv2.GaussianBlur(paper.astype(np.float32), (0, 0), 6 * sig)
     corr2 = np.where(den2 > 1e-3, num2 / np.maximum(den2, 1e-6), 0)
     blend = np.clip((den - 0.05) / 0.25, 0, 1)
-    S = S + blend * corr + (1 - blend) * corr2
+    S += (blend * corr + (1 - blend) * corr2).astype(np.float32)
 
-    alb = img / np.exp(S)[..., None]
+    alb = img.astype(np.float32, copy=False) / np.exp(S)[..., None]
     pw = valid & paper
-    gains = np.array([np.median(alb[..., c][pw]) for c in range(3)])
-    return alb / gains
+    gains = np.array([np.median(alb[..., c][pw]) for c in range(3)], np.float32)
+    alb /= gains
+    return alb
 
 
 def fuse_views(albs, valids, mags, ref=0, cap=16, ref_bonus=3.0, power=4.0):
@@ -1117,9 +1200,39 @@ def parallax_deg(q0, qj, R, cam):
     return float(np.degrees(np.median(np.arccos(np.clip((d0 * dj).sum(1), -1, 1)))))
 
 
-def match_ref(kp0, d0, g, mask, n_features):
-    sift = cv2.SIFT_create(nfeatures=n_features, contrastThreshold=0.02)
-    kp, d = sift.detectAndCompute(g, mask)
+def sift_detect(g, mask, n_features, ny=4, nx=3, overlap=200):
+    """SIFT on overlapping tiles, one after another. OpenCV's SIFT upsamples the image 2x
+    internally (~2 GB for a 9 MP photo); per tile the memory is a fraction of that and the
+    keypoints are the same. Each keypoint is kept by the tile whose core contains it."""
+    h, w = g.shape
+    ys = np.linspace(0, h, ny + 1).astype(int)
+    xs = np.linspace(0, w, nx + 1).astype(int)
+    kps, ds = [], []
+    sift = cv2.SIFT_create(contrastThreshold=0.02)
+    for i in range(ny):
+        for j in range(nx):
+            y0, y1, x0, x1 = ys[i], ys[i + 1], xs[j], xs[j + 1]
+            Y0, Y1, X0, X1 = max(y0 - overlap, 0), min(y1 + overlap, h), max(x0 - overlap, 0), min(x1 + overlap, w)
+            m = mask[Y0:Y1, X0:X1] if mask is not None else None
+            if m is not None and not m.any():
+                continue
+            kp, d = sift.detectAndCompute(np.ascontiguousarray(g[Y0:Y1, X0:X1]), m)
+            if d is None:
+                continue
+            for k, dk in zip(kp, d):
+                x, y = k.pt[0] + X0, k.pt[1] + Y0
+                if x0 <= x < x1 and y0 <= y < y1:
+                    kps.append(cv2.KeyPoint(x, y, k.size, k.angle, k.response, k.octave, k.class_id))
+                    ds.append(dk)
+    d = np.array(ds, np.float32).reshape(-1, 128)
+    if n_features and len(kps) > n_features:
+        order = np.argsort([-k.response for k in kps], kind="stable")[:n_features]
+        kps = [kps[i] for i in order]
+        d = d[order]
+    return kps, d
+
+
+def match_ref(kp0, d0, kp, d):
     flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=64))
     m01 = flann.knnMatch(d0, d, k=2)
     m10 = flann.knnMatch(d, d0, k=2)
@@ -1132,7 +1245,7 @@ def match_ref(kp0, d0, g, mask, n_features):
     return np.array(i0, int), np.float64(pj), len(kp)
 
 
-def densify_multi(g0, gs, mask, p_ref, X, cam, Rs, ts, max_pts, min_dist, search):
+def densify_multi(g0, gs, mask, p_ref, X, cam, Rs, ts, max_pts, min_dist, search, threads=1):
     """Guided matching from reference corners into every other view: position
     predicted by projecting nearby reconstructed points, refined by NCC."""
     from scipy.spatial import cKDTree
@@ -1144,11 +1257,13 @@ def densify_multi(g0, gs, mask, p_ref, X, cam, Rs, ts, max_pts, min_dist, search
     q = q[d < 200]
     obs = np.full((len(q), len(Rs), 2), np.nan)
     obs[:, 0] = q
-    for j in range(1, len(Rs)):
+    def one(j):
         pj, _ = project(X, Rs[j], ts[j], cam)
         A, pred = local_affines(p_ref, pj, q)
         r, ok = refine_subpixel(g0, gs[j], q, pred, A, win=21, search=search)
         ok &= np.linalg.norm(r - pred, axis=1) < search - 1
+        return r, ok
+    for j, (r, ok) in zip(range(1, len(Rs)), run_parallel(one, range(1, len(Rs)), threads)):
         obs[ok, j] = r[ok]
     keep = np.isfinite(obs[:, 1:, 0]).any(1)
     return q[keep], obs[keep]
@@ -1173,6 +1288,7 @@ def clean_obs(X, obs, Rs, ts, cam, thr):
 # ---------------------------------------------------------------- main
 
 def main():
+    limit_malloc_arenas()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("images", nargs="+", help="reference view first, then 1-3 more views (left/right/up/down)")
     ap.add_argument("-o", "--out", default="out")
@@ -1194,6 +1310,10 @@ def main():
                     help="do not straighten printed horizontal/vertical lines")
     ap.add_argument("--anchor-w", type=float, default=0.1,
                     help="how strongly measured content resists the edge/line correction")
+    ap.add_argument("--minimal", action="store_true",
+                    help="skip debug outputs (points.ply, heightfield.png, overlay.jpg, flat_raw.png)")
+    ap.add_argument("--threads", type=int, default=os.cpu_count() or 1,
+                    help="worker threads for per-view work (1 = sequential)")
     ap.add_argument("--no-clean", action="store_true",
                     help="keep paper grain and colour in flat.png (no denoise / white paper)")
     ap.add_argument("--no-edge-fix", action="store_true",
@@ -1253,18 +1373,21 @@ def main():
     mask_er = cv2.erode(masks[0], np.ones((15, 15), np.uint8))
 
     log("matching ...")
-    sift = cv2.SIFT_create(nfeatures=args.features, contrastThreshold=0.02)
-    kp0, d0 = sift.detectAndCompute(gs[0], mask_er)
+    kp0, d0 = sift_detect(gs[0], mask_er, args.features)
     P0 = np.float64([k.pt for k in kp0])
     obs = np.full((len(kp0), V, 2), np.nan)
     obs[:, 0] = P0
-    Rs, ts = [np.eye(3)], [np.zeros(3)]
     Ks = cam_K(cam)
-    extra = []  # rows from tilt-simulated matching (not tied to reference keypoints)
-    sims0 = None
-    for j in range(1, V):
-        mj = cv2.dilate(masks[j], np.ones((41, 41), np.uint8)) if masks[j] is not None else None
-        i0, pj, nk = match_ref(kp0, d0, gs[j], mj, args.features)
+    mjs = [None] + [cv2.dilate(masks[j], np.ones((41, 41), np.uint8)) if masks[j] is not None else None
+                    for j in range(1, V)]
+    feats_j = [None] + [sift_detect(gs[j], mjs[j], args.features) for j in range(1, V)]
+    sims0 = []
+    sims_lock = threading.Lock()
+
+    def match_view(j):
+        mj = mjs[j]
+        kpj, dj = feats_j[j]
+        i0, pj, nk = match_ref(kp0, d0, kpj, dj)
         E, inl = cv2.findEssentialMat(P0[i0], pj, Ks, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=1.0)
         inl = inl.ravel().astype(bool)
         i0, pj = i0[inl], pj[inl]
@@ -1276,10 +1399,11 @@ def main():
             sa = min(1.0, 2000.0 / max(gs[0].shape))
             small = lambda im: cv2.resize(im, None, fx=sa, fy=sa, interpolation=cv2.INTER_AREA) if sa < 1 else im
             sift_s = cv2.SIFT_create(nfeatures=8000, contrastThreshold=0.02)
-            if sims0 is None:
-                sims0 = tilt_sims(small(gs[0]), small(mask_er), (1, 2 ** 0.5, 2), sift_s)
+            with sims_lock:
+                if not sims0:
+                    sims0.append(tilt_sims(small(gs[0]), small(mask_er), (1, 2 ** 0.5, 2), sift_s))
             simsj = tilt_sims(small(gs[j]), small(mj) if mj is not None else None, (1, 2 ** 0.5, 2, 2 * 2 ** 0.5), sift_s)
-            a0, aj = asift_match(sims0, simsj)
+            a0, aj = asift_match(sims0[0], simsj)
             a0, aj = (a0 + 0.5) / sa - 0.5, (aj + 0.5) / sa - 0.5
             q0, qj = np.r_[q0, a0], np.r_[qj, aj]
             E, inl = cv2.findEssentialMat(q0, qj, Ks, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=1.5)
@@ -1297,6 +1421,14 @@ def main():
         A, _ = local_affines(q0, qj)
         pr, ok = refine_subpixel(gs[0], gs[j], q0, qj, A)
         ok &= np.linalg.norm(pr - qj, axis=1) < (3.0 if used_asift else 1.5)
+        msg = (f"  view {j}: {nk} keypoints, {len(q0)} inliers, {ok.sum()} refined, page coverage {cov:.2f}"
+               + (f" -> {page_coverage(q0[ok], mask_er):.2f} with tilt simulation" if used_asift else ""))
+        return i0, q0, pr, ok, used_asift, R, t, msg
+
+    results = run_parallel(match_view, range(1, V), args.threads)
+    Rs, ts = [np.eye(3)], [np.zeros(3)]
+    extra = []  # rows from tilt-simulated matching (not tied to reference keypoints)
+    for j, (i0, q0, pr, ok, used_asift, R, t, msg) in zip(range(1, V), results):
         n_plain = len(i0)
         okp = ok[:n_plain]
         obs[i0[okp], j] = pr[:n_plain][okp]
@@ -1307,8 +1439,8 @@ def main():
             e[:, j] = pr[n_plain:][oka]
             extra.append(e)
         Rs.append(R); ts.append(t.ravel())
-        log(f"  view {j}: {nk} keypoints, {len(q0)} inliers, {ok.sum()} refined, page coverage {cov:.2f}"
-            + (f" -> {page_coverage(q0[ok], mask_er):.2f} with tilt simulation" if used_asift else ""))
+        log(msg)
+    del feats_j
 
     keep = np.isfinite(obs[:, 1:, 0]).any(1)
     obs = np.concatenate([obs[keep]] + extra)
@@ -1352,7 +1484,8 @@ def main():
         log("densifying ...")
         gu0, gv0, Z0, _ = fit_heightfield(uvz, bnd, 2 * args.grid, args.smooth)
         mind = max(4, int(round(min(gs[0].shape) / 400)))
-        q, dobs = densify_multi(gs[0], gs, mask_er, obs[:, 0], X, cam, Rs, ts, args.dense, mind, search=6)
+        q, dobs = densify_multi(gs[0], gs, mask_er, obs[:, 0], X, cam, Rs, ts, args.dense, mind, search=6,
+                                 threads=args.threads)
         Xd = triangulate_multi(dobs, Rs, ts, cam)
         Xd, dobs, derr = clean_obs(Xd, dobs, Rs, ts, cam, 1.0)
         uvzd = to_page(F, Xd)
@@ -1421,6 +1554,11 @@ def main():
         counts = np.bincount(bside, minlength=4) if len(Xb) else np.zeros(4, int)
         log(f"  outline points triangulated: top {counts[0]}, right {counts[1]}, "
             f"bottom {counts[2]}, left {counts[3]} (of {len(out0)})")
+
+    # from here on only the reference photo is needed (all photos with --fuse)
+    gs = gs[:1]
+    if not args.fuse:
+        fulls, imgs = fulls[:1], imgs[:1]
 
     if len(Xb):
         bnd = grid_bounds(np.r_[uvz[:, :2], to_page(F, Xb)[:, :2]], W, H)
@@ -1587,21 +1725,23 @@ def main():
     if len(Xb):
         np.savetxt(os.path.join(args.out, "outline.csv"), to_page(F, Xb), delimiter=",", fmt="%.4f",
                    header="u_mm,v_mm,z_mm", comments="")
-    write_ply(os.path.join(args.out, "points.ply"), uvz, cols)
+    if not args.minimal:
+        write_ply(os.path.join(args.out, "points.ply"), uvz, cols)
     np.savez(os.path.join(args.out, "heightfield.npz"), u=gu, v=gv, z=Z, st=st,
              f=cam["f"] / sf, k1=cam["k1"], k2=cam["k2"], R=np.array(Rs), t=np.array(ts),
              origin=F["o"], eu=F["eu"], ev=F["ev"], en=F["en"], scale=F["scale"])
-    allpts = np.r_[uvz, to_page(F, Xb)] if len(Xb) else uvz
-    save_heightmap_png(os.path.join(args.out, "heightfield.png"), gu, gv, Z, allpts, W, H)
-
-    dbg = imgs[0].copy()
-    zl = np.percentile(np.abs(uvz[:, 2]), 99) + 1e-6
-    zc = np.clip((uvz[:, 2] / zl + 1) * 127.5, 0, 255).astype(np.uint8)
-    cm = cv2.applyColorMap(zc.reshape(-1, 1), cv2.COLORMAP_JET).reshape(-1, 3)
-    for (x, y), cc in zip(obs[:, 0].astype(int), cm):
-        cv2.circle(dbg, (x, y), 2, tuple(int(v) for v in cc), -1)
-    cv2.polylines(dbg, [out0.astype(np.int32)], True, (0, 255, 0), 2)
-    cv2.imwrite(os.path.join(args.out, "overlay.jpg"), dbg, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not args.minimal:
+        allpts = np.r_[uvz, to_page(F, Xb)] if len(Xb) else uvz
+        save_heightmap_png(os.path.join(args.out, "heightfield.png"), gu, gv, Z, allpts, W, H)
+        dbg = imgs[0].copy()
+        zl = np.percentile(np.abs(uvz[:, 2]), 99) + 1e-6
+        zc = np.clip((uvz[:, 2] / zl + 1) * 127.5, 0, 255).astype(np.uint8)
+        cm = cv2.applyColorMap(zc.reshape(-1, 1), cv2.COLORMAP_JET).reshape(-1, 3)
+        for (x, y), cc in zip(obs[:, 0].astype(int), cm):
+            cv2.circle(dbg, (x, y), 2, tuple(int(v) for v in cc), -1)
+        cv2.polylines(dbg, [out0.astype(np.int32)], True, (0, 255, 0), 2)
+        cv2.imwrite(os.path.join(args.out, "overlay.jpg"), dbg, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        del dbg
 
     camf = dict(cam, f=cam["f"] / sf, cx=(cam["cx"] + 0.5) / sf - 0.5, cy=(cam["cy"] + 0.5) / sf - 0.5)
     inv = flat_to_uv(st, gu, gv, W, H)
@@ -1609,7 +1749,8 @@ def main():
     Xr, shape, nu_m, nv_m, page = flat_geometry(camf, F, gu, gv, Z, W, H, args.dpi, inv)
     views = list(range(V)) if args.fuse else [0]
     rend = [render_view(fulls[j], Xr, shape, camf, Rs[j], ts[j]) for j in views]
-    cv2.imwrite(os.path.join(args.out, "flat_raw.png"), np.clip(rend[0][0], 0, 255).astype(np.uint8))
+    if not args.minimal:
+        cv2.imwrite(os.path.join(args.out, "flat_raw.png"), np.clip(rend[0][0], 0, 255).astype(np.uint8))
     if args.no_shading:
         albs = [r[0] / 255.0 for r in rend]
     else:
