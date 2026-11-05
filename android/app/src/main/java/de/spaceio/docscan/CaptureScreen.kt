@@ -21,7 +21,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Switch
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -65,6 +68,8 @@ fun CaptureScreen(model: ScanModel) {
     val rig = remember { CameraRig(context) }
     var quad by remember { mutableStateOf<FloatArray?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var settings by remember { mutableStateOf(false) }
+    if (settings) SettingsDialog(model) { settings = false }
     val previewView = remember {
         PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
     }
@@ -114,6 +119,12 @@ fun CaptureScreen(model: ScanModel) {
                 modifier = Modifier.align(Alignment.BottomCenter).padding(8.dp)
                     .background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(8.dp, 4.dp),
             )
+            IconButton(
+                onClick = { settings = true }, enabled = !busy,
+                modifier = Modifier.align(Alignment.TopEnd).padding(8.dp).background(Color(0x99000000), CircleShape),
+            ) {
+                Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Color.White)
+            }
         }
         Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
             STEPS.forEachIndexed { i, (name, _) ->
@@ -141,16 +152,6 @@ fun CaptureScreen(model: ScanModel) {
             )
         }
         Spacer(Modifier.weight(1f))
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("Clean look", color = Color.White, fontSize = 15.sp)
-                Text("black text on white; turn off for light grey print", color = Color.Gray, fontSize = 12.sp)
-            }
-            Switch(checked = model.docTone, onCheckedChange = { model.changeDocTone(it) })
-        }
         Row(
             Modifier.fillMaxWidth().padding(bottom = 24.dp),
             horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically,
