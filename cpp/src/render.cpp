@@ -163,6 +163,59 @@ cv::Mat remove_shading(const cv::Mat& img, const cv::Mat& valid, const cv::Mat& 
                 resm.at<float>(y, x) = pp ? r : 0.f;
             }
     });
+    // Fold shadows: darker regions that reach the page edge and run across a good part of the page
+    // are shading, not print (printed grey areas rarely touch the edge). The 3D normals explain
+    // most of them; with one photo nothing does. Text is removed from the residual by a closing.
+    {
+        const int f = 4;
+        const double ppm = std::max(oh, ow) / 297.0 / f;  // pixels per mm at 1/f size
+        cv::Mat R(oh, ow, CV_32F, cv::Scalar(0)), Rs, vs, Rc;
+        parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+            for (int y = rg.start; y < rg.end; y++)
+                for (int x = 0; x < ow; x++)
+                    if (valid.at<uchar>(y, x)) R.at<float>(y, x) = L.at<float>(y, x) - S.at<float>(y, x);
+        });
+        cv::resize(R, Rs, cv::Size(), 1.0 / f, 1.0 / f, cv::INTER_AREA);
+        cv::resize(valid, vs, Rs.size(), 0, 0, cv::INTER_NEAREST);
+        int k = std::max(3, (int)std::lround(1.5 * ppm)) | 1;
+        cv::morphologyEx(Rs, Rc, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(k, k)));
+        cv::Mat cand = (Rc < -0.08f) & (Rc > -0.7f) & (vs > 0), edge, lab, stats, cent;
+        cv::dilate(vs == 0, edge, cv::Mat::ones(3, 3, CV_8U));
+        int n = cv::connectedComponentsWithStats(cand, lab, stats, cent, 8, CV_32S);
+        std::vector<char> keep(n, 0), touch(n, 0);
+        for (int y = 0; y < lab.rows; y++)
+            for (int x = 0; x < lab.cols; x++) {
+                int l = lab.at<int>(y, x);
+                if (l && (edge.at<uchar>(y, x) || x == 0 || y == 0 || x == lab.cols - 1 || y == lab.rows - 1))
+                    touch[l] = 1;
+            }
+        int kept = 0;
+        for (int l = 1; l < n; l++) {
+            int w = stats.at<int>(l, cv::CC_STAT_WIDTH), h = stats.at<int>(l, cv::CC_STAT_HEIGHT);
+            keep[l] = touch[l] && stats.at<int>(l, cv::CC_STAT_AREA) > 0.002 * lab.total() &&
+                      (w > 0.3 * lab.cols || h > 0.3 * lab.rows);
+            kept += keep[l];
+        }
+        if (kept) {
+            cv::Mat sh(lab.size(), CV_8U), shf, Rcf;
+            for (int i = 0; i < (int)lab.total(); i++) sh.data[i] = keep[((int*)lab.data)[i]] ? 255 : 0;
+            cv::dilate(sh, sh, cv::Mat::ones(3, 3, CV_8U));
+            cv::resize(sh, shf, valid.size(), 0, 0, cv::INTER_NEAREST);
+            cv::resize(Rc, Rcf, valid.size(), 0, 0, cv::INTER_LINEAR);
+            parallel_for(cv::Range(0, oh), [&](const cv::Range& rg) {
+                for (int y = rg.start; y < rg.end; y++)
+                    for (int x = 0; x < ow; x++) {
+                        if (!shf.at<uchar>(y, x) || !valid.at<uchar>(y, x)) continue;
+                        float r = R.at<float>(y, x);
+                        if (r > Rcf.at<float>(y, x) - 0.10f && r < 0.10f) {
+                            paper.at<float>(y, x) = 1.f;
+                            resm.at<float>(y, x) = r;
+                        }
+                    }
+            });
+        }
+        log(fmt("  shading: %d fold shadow region%s", kept, kept == 1 ? "" : "s"));
+    }
     // residual correction on paper pixels (normalized convolution), wide fallback where
     // paper evidence is sparse
     double sig = std::max(oh, ow) / 200.0;
