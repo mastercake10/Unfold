@@ -46,6 +46,11 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
     // the pipeline needs more stack than a default thread has
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(null, r, "docscan", 64L shl 20) }
     private val accepted = ArrayList<File>()  // photos the native session holds; worker thread only
+    // Result for photo 1 alone, made right after it is accepted (most scans have one photo), so
+    // "Process" can show it at once. Worker thread only; valid while photo 1 is the only photo.
+    private var early: File? = null
+    private var earlyErr: String? = null
+    private var earlyFor: File? = null
     private var counter = 0
 
     val shots = mutableStateListOf<File>()
@@ -83,6 +88,12 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
                     notice = "$err\nPlease take this photo again."
                 }
             }
+            if (err == null && accepted.size == 1) {
+                val out = File(outDir, "early.png")
+                earlyErr = Native.finish(out.path)
+                early = out
+                earlyFor = f
+            }
         }
     }
 
@@ -94,6 +105,7 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
                 accepted.removeAt(accepted.size - 1)
                 Native.removeLast()
             }
+            if (accepted.size != 1 || accepted[0] != earlyFor) early = null
             f.delete()
         }
     }
@@ -105,6 +117,7 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
         worker.execute {
             Native.reset()
             accepted.clear()
+            early = null
             shotDir.listFiles()?.forEach { it.delete() }
             outDir.listFiles()?.forEach { it.delete() }
         }
@@ -118,7 +131,14 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
         val out = File(outDir, "docscan_$stamp.png")
         val t0 = SystemClock.elapsedRealtime()  // what the user waits for, including photos still in analysis
         worker.execute {
-            val err = if (accepted.isEmpty()) "No usable photo." else Native.finish(out.path)
+            val e = early
+            val err = when {
+                accepted.isEmpty() -> "No usable photo."
+                accepted.size == 1 && e != null && earlyFor == accepted[0] ->
+                    earlyErr ?: if (e.renameTo(out)) null else Native.finish(out.path)
+                else -> Native.finish(out.path)
+            }
+            early = null
             val sec = (SystemClock.elapsedRealtime() - t0) / 1000.0
             val log = Native.log()
             // 0 = none ... 3 = severe: the CPU is slowed down to cool the phone
@@ -127,7 +147,7 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
             runCatching {
                 logFile.writeText(log + "\nwait after last photo: %.1f s, thermal status %d\n".format(sec, thermal))
             }
-            val notes = log.lines().filter { "leaving out photo" in it }.map { it.substringAfter("] ") }
+            val notes = log.lines().filter { "leaving out" in it }.map { it.substringAfter("] ") }
             val result = if (err != null) Phase.Failed(err)
             else BitmapFactory.decodeFile(out.path)?.let { Phase.Done(out, it, sec, notes) }
                 ?: Phase.Failed("cannot read the result")
