@@ -10,21 +10,35 @@ Eigen 3.3+ (header-only). Both are available for Android (OpenCV Android SDK inc
 ```
 sudo apt install libopencv-dev libeigen3-dev
 cmake -S cpp -B cpp/build -G Ninja && ninja -C cpp/build
-cpp/build/docscan ref.jpg right.jpg up.jpg down.jpg -o out            # 4 views
+cpp/build/docscan page.jpg -o out --focal-px 3030                    # 1 photo
 cpp/build/docscan ref.jpg right.jpg -o out --focal-px 3030            # 2 views: pass the focal
+cpp/build/docscan ref.jpg right.jpg up.jpg down.jpg -o out            # 4 views
 ```
 
+One photo: there is no 3D measurement. The page is taken as the plane through its four corners
+(focal length from the camera; results barely change with a focal 17 % off), then the curved
+outline is pulled onto the A4 rectangle and printed lines and text lines are straightened. OCR
+reads it as well as 2 or 4 views (tesseract, 5 samples: 92-98 % of the scan's words in all three
+modes); geometry is about 2x less exact (median 0.18-0.48 mm vs 0.14-0.25 mm against the scans).
+Text lines (ink centre per 3 mm column of each line, also vertical ones for landscape pages)
+are used in every mode; `DOCSCAN_TEXTLINES=0` turns them off. The output is turned so the text
+is upright (text line direction, ascenders vs descenders); `--no-rotate` turns that off.
+
 Library API (`src/docscan.hpp`): `cv::Mat docscan::process(images, options)`; throws
-`std::runtime_error` with a user-facing message. The CLI reads the focal length from EXIF
+`std::runtime_error` with a user-facing message (1 to 8 photos). The CLI reads the focal length from EXIF
 (`FocalLengthIn35mmFilm`); in the app, pass `Options::focal_px` from the camera characteristics.
 For capture apps, `docscan::Session` splits the work: `add(photo)` does the per-photo part (page
-outline, SIFT, matching with photo 1) and returns a message if the photo is unusable; `finish()`
-does the rest. Photos that fail matching or the scale check are left out if at least 2 remain.
+outline; from the second photo on SIFT and matching with photo 1) and returns a message if the
+photo is unusable; `finish()` does the rest. Photos that fail matching or the scale check are
+left out (down to 1 photo).
 
 GPU SIFT (`src/gpu_sift.cpp`, `src/shaders/`): Vulkan compute port of OpenCV's SIFT (same
 parameters, same tiles), used when the build finds Vulkan and `glslc`; falls back to OpenCV on
 any GPU error. `--no-gpu` or `DOCSCAN_GPU=0` disables it, `DOCSCAN_GPU=cpu` selects a software
-Vulkan device for testing.
+Vulkan device for testing. The same device runs non-local means denoising (`shaders/nlm.comp`)
+on the top part of the page while OpenCV does the rest; the split follows the measured speeds.
+Parallel loops use an own pool of persistent threads (`parallel_for` in `common`), because
+OpenCV runs a `parallel_for_` serially while another thread is inside one.
 
 Layout: `common` (types, kd-tree, robust Levenberg-Marquardt), `camera` (triangulation, bundle
 adjustment with exact Jacobian), `matching` (page quad/outline, tiled SIFT, FLANN, essential

@@ -1,17 +1,18 @@
 # DocScan for Android
 
-Guided capture of 4 photos, then the C++ pipeline (`../cpp/src`, via JNI) on the phone; the
+One photo of the page (a second one is optional, for more exact geometry), then the C++ pipeline (`../cpp/src`, via JNI) on the phone; the
 flat page is saved to `Pictures/DocScan` or shared (e.g. to the Paperless app).
 
 - Camera: back camera at 1x, 4:3 full resolution. Focus is measured on the first photo and
   then locked, so all views share one focal length. The start value for the focal length comes
   from the camera characteristics (lens mm / pixel pitch); bundle adjustment refines it.
-- Live page outline (green: whole page in view). Shots: start (rendered), right, up, down, each
-  10–20 cm from the first position. "Process" works from 2 shots (focal then kept fixed).
-- Each photo is analysed right after it is taken (page outline, features, matching with photo 1,
-  via `docscan::Session`), so after the last photo only the 3D, unrolling and rendering part is
-  left. A photo that cannot be used (no page, phone not moved, no match) is rejected at once with
-  a message, and the user retakes it.
+- Live page outline (green: whole page in view). Shot 1: the page (rendered). "Process" works
+  from 1 shot. Optional shot 2: 10–20 cm to the right of the first position, for folded pages
+  (the 3D part then measures the folds; focal kept fixed).
+- Each photo is analysed right after it is taken (page outline; with a second photo features and
+  matching with photo 1, via `docscan::Session`). A photo that cannot be used (no page, phone not
+  moved, no match) is rejected at once with a message, and the user retakes it.
+- The output is turned so the text is upright.
 - The 3D part runs on photos downscaled to 3200 px (same page pixels/mm as the full-size 16:9
   photos the pipeline was tuned on); the page is rendered from the full-size first photo.
 - "Send report" shares the photos and the timed log (`log.txt`) for debugging.
