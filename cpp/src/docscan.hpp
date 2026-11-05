@@ -25,6 +25,7 @@ struct Options {
     double anchor_w = 0.1;              // how strongly measured content resists line straightening
     bool gpu = true;                    // SIFT on the GPU (Vulkan) if built in and available
     bool rotate = true;                 // turn the output so the text is upright
+    bool doc_tone = false;              // ink to black, light grey to white (cleaner; fades light grey text)
 };
 
 // images: reference view first (rendered), then 1-7 more views, BGR, same camera and size.

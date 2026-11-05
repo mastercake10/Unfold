@@ -25,7 +25,11 @@ Text lines are used in every mode; `DOCSCAN_TEXTLINES=0` turns them off. They ar
 that kink at a crease are kept whole; vertical ones too for landscape pages. With one photo they
 weigh 8x more (nothing else measures the shape inside the page): on 4 one-photo samples compared
 with the source PDFs, text tilt went from 0.2-0.6 deg rms to 0.07-0.3 deg and tesseract finds
-96.6 % of the PDF's words (OCR of the PDF image itself: 97.2 %). The output is turned so the text
+96.6 % of the PDF's words (OCR of the PDF image itself: 97.2 %).
+`--doc-tone` (`Options::doc_tone`) gives a scanner-app look: ink to black, light grey to white.
+With tesseract's default layout mode (as in Paperless) it matched Genius Scan on the 4 one-photo
+samples (96.2 vs 96.1 % of the PDF's words, 90.9 % without), but lost 3-9 % on pages with light
+grey text (CV headings, UML card), so it is off by default. The output is turned so the text
 is upright (text line direction, ascenders vs descenders); `--no-rotate` turns that off.
 
 Library API (`src/docscan.hpp`): `cv::Mat docscan::process(images, options)`; throws

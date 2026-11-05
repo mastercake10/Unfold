@@ -361,7 +361,7 @@ static void denoise(const cv::Mat& g8, cv::Mat& gd, bool gpu) {
 
 // Scanner-like paper: denoise, even out small paper-level variations, push the paper to
 // white with a ramp. Pages without real colour come back single-channel.
-cv::Mat clean_paper(const cv::Mat& img, bool gpu) {
+cv::Mat clean_paper(const cv::Mat& img, bool gpu, bool doc_tone) {
     const double near = 0.10;
     int oh = img.rows, ow = img.cols;
     cv::Mat gray(oh, ow, CV_32F), colmask(oh, ow, CV_8U), g8(oh, ow, CV_8U);
@@ -412,6 +412,13 @@ cv::Mat clean_paper(const cv::Mat& img, bool gpu) {
                 double v = e.at<float>(y, x);
                 double yv = v <= lo ? v : lo + (v - lo) * (255 - lo) / std::max(hi - lo, 1e-3);
                 yv = std::clamp(yv, 0.0, 255.0);
+                if (doc_tone) {
+                    // ink to black, light grey (blur halos, leftover shading) to white, like
+                    // scanner apps. Tesseract's layout analysis (psm 3) drops other blocks then:
+                    // +5 % words on some pages, -3..-9 % on pages with light grey text
+                    double tc = std::clamp((yv - 40.0) / (245.0 - 40.0), 0.0, 1.0);
+                    yv = 255.0 * tc * tc * (3 - 2 * tc);
+                }
                 if (!colour) out.at<uchar>(y, x) = (uchar)yv;
                 else {
                     double k = yv / std::max((double)gray.at<float>(y, x), 1.0);

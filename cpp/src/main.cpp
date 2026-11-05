@@ -63,6 +63,7 @@ static void usage() {
     std::fprintf(stderr,
                  "usage: docscan ref.jpg [view2.jpg [view3.jpg view4.jpg]] [-o OUT_DIR] [--focal-px F]\n"
                  "               [--page WxH] [--dpi N] [--max-side PX] [--features N] [--no-gpu] [--no-rotate]\n"
+                 "               [--doc-tone]\n"
                  "  The first photo is the reference that gets rendered; 4 views recommended.\n"
                  "  With 2 views the focal length is kept fixed: pass --focal-px (Pixel 8 16:9: 3030).\n");
 }
@@ -91,6 +92,7 @@ int main(int argc, char** argv) {
         else if (a == "--features") opt.features = std::stoi(next());
         else if (a == "--no-gpu") opt.gpu = false;
         else if (a == "--no-rotate") opt.rotate = false;
+        else if (a == "--doc-tone") opt.doc_tone = true;
         else if (a == "--page") {
             std::string v = next();
             if (std::sscanf(v.c_str(), "%lfx%lf", &opt.page_w, &opt.page_h) != 2) {

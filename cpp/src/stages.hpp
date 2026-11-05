@@ -102,7 +102,7 @@ Render render_flat(const cv::Mat& img, const Cam& cam, const Frame& F, const Sur
 cv::Mat gray_u8(const cv::Mat& img32, const cv::Mat& page);
 cv::Mat remove_shading(const cv::Mat& img, const cv::Mat& valid, const cv::Mat& nu, const cv::Mat& nv);
 cv::Mat to_uint8(const cv::Mat& alb, double white = 0.95);
-cv::Mat clean_paper(const cv::Mat& img, bool gpu = false);
+cv::Mat clean_paper(const cv::Mat& img, bool gpu = false, bool doc_tone = false);
 // Clockwise rotation (0, 90, 180, 270) that makes the text upright, judged by the direction of
 // the text lines and by ascenders (above the lowercase band) outweighing descenders.
 // ppm: pixels per mm of img. Returns 0 if there is too little text to tell.
