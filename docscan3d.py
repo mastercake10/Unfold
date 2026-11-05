@@ -589,17 +589,25 @@ def sample_heightfield(gu, gv, Z, U, V):
             + (1 - a) * b * Z[j0 + 1, i0] + a * b * Z[j0 + 1, i0 + 1])
 
 
-def ray_surface(rays, F, gu, gv, Z, c, n, iters=50):
-    """Intersect reference-camera rays with the measured surface (vectorized bisection)."""
+def ray_surface(rays, F, gu, gv, Z, c, n, iters=40, n_scan=41):
+    """Intersect reference-camera rays with the measured surface. The ray is scanned
+    for all crossings and the one nearest the plane estimate is refined by bisection
+    (the extrapolated surface beyond the page can produce a second, wrong crossing)."""
     lam0 = (c @ n) / (rays @ n)
 
     def f(lam):
         uvz = to_page(F, rays * lam[:, None])
         return uvz[:, 2] - sample_heightfield(gu, gv, Z, uvz[:, 0], uvz[:, 1])
 
-    lo, hi = 0.6 * lam0, 1.4 * lam0
-    flo, fhi = f(lo), f(hi)
-    ok = flo * fhi <= 0
+    fr = np.linspace(0.6, 1.4, n_scan)
+    vals = np.stack([f(lam0 * k) for k in fr], 1)
+    cross = vals[:, :-1] * vals[:, 1:] <= 0
+    ok = cross.any(1)
+    centre = np.abs(0.5 * (fr[:-1] + fr[1:]) - 1.0)
+    pick = np.argmin(np.where(cross, centre[None, :], np.inf), axis=1)
+    lo = lam0 * fr[pick]
+    hi = lam0 * fr[np.minimum(pick + 1, n_scan - 1)]
+    flo = f(lo)
     for _ in range(iters):
         mid = 0.5 * (lo + hi)
         fm = f(mid)
@@ -638,27 +646,98 @@ def fit_rectangle(st, side, W, H, x0):
     return res.x, xf, r
 
 
-def edge_correction(st_o, side, st_c, ctarget, W, H, max_mm=6.0):
-    """Smooth displacement fields that put the flattened outline exactly on the
-    rectangle: s-shifts from the left/right edges, t-shifts from top/bottom,
-    both from the corners. Thin-plate splines fade them into the interior;
-    nothing is imposed along an edge (tangential direction)."""
-    from scipy.interpolate import RBFInterpolator
+def detect_lines(flat_gray, W, H, min_mm=8.0, max_dev_deg=3.0, border_mm=4.0):
+    """Near-axis line segments in a flat render, in flat mm: (segments, is_horizontal)."""
+    oh, ow = flat_gray.shape
+    L = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD).detect(flat_gray)[0]
+    if L is None:
+        return np.empty((0, 4)), np.empty(0, bool)
+    L = L.reshape(-1, 4).astype(float) * (W / ow)
+    d = L[:, 2:] - L[:, :2]
+    length = np.hypot(d[:, 0], d[:, 1])
+    ang = np.degrees(np.arctan2(d[:, 1], d[:, 0])) % 180
+    dev = (ang + 45) % 90 - 45
+    horiz = np.abs(((ang + 90) % 180) - 90) < 45
+    inside = lambda p: (p[:, 0] > border_mm) & (p[:, 0] < W - border_mm) & (p[:, 1] > border_mm) & (p[:, 1] < H - border_mm)
+    keep = (length >= min_mm) & (np.abs(dev) < max_dev_deg) & inside(L[:, :2]) & inside(L[:, 2:])
+    return L[keep], horiz[keep]
+
+
+def fit_correction(W, H, edges, lines, anchors, step=4.0, lam=30.0, w_edge=1.0, w_line=1.0, w_anchor=0.1):
+    """One smooth 2D displacement field on the flat page, per axis, from
+      edges:   (points, axis, target)  -> point + D = target   (paper edge on the rectangle)
+      lines:   (segments, is_horizontal) -> all samples of a segment share one coordinate
+               along the cross axis (straight, axis-parallel; position left free)
+      anchors: points that should stay put (measured content)
+    plus second-difference smoothness. Returns D(q) -> (n, 2) in mm."""
+    gs_ = np.arange(-2 * step, W + 3 * step, step)
+    gt_ = np.arange(-2 * step, H + 3 * step, step)
+    ns, nt = len(gs_), len(gt_)
+    N = ns * nt
+    idx = np.arange(N).reshape(nt, ns)
+
+    def bil(P):
+        fi = np.clip((P[:, 0] - gs_[0]) / step, 0, ns - 1.001)
+        fj = np.clip((P[:, 1] - gt_[0]) / step, 0, nt - 1.001)
+        i0, j0 = np.floor(fi).astype(int), np.floor(fj).astype(int)
+        a, b = fi - i0, fj - j0
+        cols = np.stack([idx[j0, i0], idx[j0, i0 + 1], idx[j0 + 1, i0], idx[j0 + 1, i0 + 1]], 1)
+        vals = np.stack([(1 - a) * (1 - b), a * (1 - b), (1 - a) * b, a * b], 1)
+        return cols, vals
+
+    tri = np.concatenate([np.stack([idx[:, :-2].ravel(), idx[:, 1:-1].ravel(), idx[:, 2:].ravel()], 1),
+                          np.stack([idx[:-2, :].ravel(), idx[1:-1, :].ravel(), idx[2:, :].ravel()], 1)])
+    Dm = sparse.csr_matrix((np.tile([1.0, -2.0, 1.0], len(tri)), (np.repeat(np.arange(len(tri)), 3), tri.ravel())),
+                           shape=(len(tri), N))
     fields = []
-    for axis, sides, targets in ((0, (3, 1), (0.0, W)), (1, (0, 2), (0.0, H))):
-        P, D = [st_c], [ctarget[:, axis] - st_c[:, axis]]
-        for sd, tg in zip(sides, targets):
-            m = side == sd
-            if m.sum() < 5:
+    for axis in (0, 1):
+        rows, cols, vals, rhs, wts = [], [], [], [], []
+        r = 0
+        n_c = 0
+        # edges
+        for P, ax, tg in edges:
+            if ax != axis or len(P) == 0:
                 continue
-            pts = st_o[m]
-            if len(pts) > 150:
-                pts = pts[np.linspace(0, len(pts) - 1, 150).astype(int)]
-            P.append(pts)
-            D.append(tg - pts[:, axis])
-        P, D = np.concatenate(P), np.clip(np.concatenate(D), -max_mm, max_mm)
-        fields.append(RBFInterpolator(P, D, kernel="thin_plate_spline", smoothing=1.0))
-    return lambda q: np.stack([f(q) for f in fields], -1)
+            c, v = bil(P)
+            rr = r + np.arange(len(P))
+            rows.append(np.repeat(rr, 4)); cols.append(c.ravel()); vals.append(v.ravel())
+            rhs.append(tg - P[:, axis]); wts.append(np.full(len(P), w_edge)); r += len(P)
+        # lines: horizontal segments constrain t (axis 1), vertical ones s (axis 0)
+        L, hz = lines
+        sel = L[hz] if axis == 1 else L[~hz]
+        for seg in sel:
+            n = max(int(np.hypot(*(seg[2:] - seg[:2])) / 2.0), 2)
+            P = seg[:2] + np.linspace(0, 1, n)[:, None] * (seg[2:] - seg[:2])
+            c, v = bil(P)
+            rr = r + np.arange(n)
+            # P_axis + D(P) - c_k = 0, c_k unknown (column N + k)
+            rows.append(np.repeat(rr, 5))
+            cols.append(np.c_[c, np.full(n, N + n_c)].ravel())
+            vals.append(np.c_[v, -np.ones(n)].ravel())
+            rhs.append(-P[:, axis]); wts.append(np.full(n, w_line / np.sqrt(n / 10.0 + 1))); r += n
+            n_c += 1
+        # anchors
+        if len(anchors):
+            c, v = bil(anchors)
+            rr = r + np.arange(len(anchors))
+            rows.append(np.repeat(rr, 4)); cols.append(c.ravel()); vals.append(v.ravel())
+            rhs.append(np.zeros(len(anchors))); wts.append(np.full(len(anchors), w_anchor)); r += len(anchors)
+        nu = N + n_c
+        if r == 0:
+            fields.append(np.zeros(N))
+            continue
+        A = sparse.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(r, nu))
+        w = np.concatenate(wts)
+        Wd = sparse.diags(w ** 2)
+        Dfull = sparse.hstack([Dm, sparse.csr_matrix((Dm.shape[0], n_c))]).tocsr()
+        M = A.T @ Wd @ A + lam * (Dfull.T @ Dfull) + 1e-6 * sparse.eye(nu)
+        x = spsolve(M.tocsc(), A.T @ (w ** 2 * np.concatenate(rhs)))
+        fields.append(x[:N])
+
+    def disp(q):
+        c, v = bil(q)
+        return np.stack([(f[c] * v).sum(1) for f in fields], 1)
+    return disp
 
 
 def corners_init(st_c, dst):
@@ -670,7 +749,7 @@ def corners_init(st_c, dst):
     return np.array([1.0, np.arctan2(R[1, 0], R[0, 0]), t[0], t[1]])
 
 
-def flatten_grid(gu, gv, Z):
+def flatten_grid(gu, gv, Z, support=None):
     """Unroll the height-field mesh into the plane, preserving 3D edge lengths
     (paper does not stretch). Returns flat (s, t) for every grid vertex, in mm."""
     U, V = np.meshgrid(gu, gv)
@@ -686,11 +765,19 @@ def flatten_grid(gu, gv, Z):
     L = np.linalg.norm(P[E[:, 0]] - P[E[:, 1]], axis=1)
     x0 = P[:, :2].ravel().copy()
     anchor = 1e-3
+    # cells far from any measured data carry extrapolated heights; their 3D lengths
+    # must not distort the unrolling of the measured page
+    we = np.ones(len(E))
+    if support is not None and len(support):
+        from scipy.spatial import cKDTree
+        mid = 0.5 * (P[E[:, 0], :2] + P[E[:, 1], :2])
+        dd = cKDTree(support).query(mid)[0]
+        we = np.clip(1.0 - (dd - 10.0) / 20.0, 0.05, 1.0)
 
     def resid(x):
         q = x.reshape(-1, 2)
         d = np.linalg.norm(q[E[:, 0]] - q[E[:, 1]], axis=1)
-        return np.concatenate([d - L, anchor * (x - x0)])
+        return np.concatenate([we * (d - L), anchor * (x - x0)])
 
     m = len(E)
     n2 = len(x0)
@@ -699,7 +786,7 @@ def flatten_grid(gu, gv, Z):
     S = sparse.csr_matrix((np.ones(len(rows), int), (rows, cols)), shape=(m + n2, n2))
     res = least_squares(resid, x0, jac_sparsity=S, method="trf", x_scale=1.0, max_nfev=200)
     st = res.x.reshape(nv_, nu_, 2)
-    strain = np.abs(resid(res.x)[:m]) / L
+    strain = np.abs(resid(res.x)[:m]) / we / L
     return st, float(np.median(strain)), float(strain.max())
 
 
@@ -1044,6 +1131,10 @@ def main():
     ap.add_argument("--dpi", type=int, default=200, help="dpi of the flattened output")
     ap.add_argument("--no-densify", action="store_true")
     ap.add_argument("--no-outline", action="store_true", help="do not triangulate the page outline")
+    ap.add_argument("--no-line-fix", action="store_true",
+                    help="do not straighten printed horizontal/vertical lines")
+    ap.add_argument("--anchor-w", type=float, default=0.1,
+                    help="how strongly measured content resists the edge/line correction")
     ap.add_argument("--no-edge-fix", action="store_true",
                     help="do not force the detected page outline onto the rectangle")
     ap.add_argument("--fuse", action="store_true",
@@ -1233,6 +1324,7 @@ def main():
     side = np.array([{"top": 0, "right": 1, "bottom": 2, "left": 3}[F["edge_map"][e]] if e >= 0 else -1
                      for e in eid])
     Xb = np.empty((0, 3))
+    bidx = np.empty(0, int)
     if not args.no_outline:
         log("outline ...")
         outs = [None] + [page_outline(gs[j], masks[j])[0] if masks[j] is not None else None for j in range(1, V)]
@@ -1241,6 +1333,7 @@ def main():
         Xb, bobs, has = triangulate_outline(out0, outs, cam, Rs, ts, Xp)
         bobs, bside = bobs[has], side[has]
         Xb = Xb[has]
+        bidx = np.nonzero(has)[0]
         if len(Xb):
             # drop the worst inconsistent observation per point until the rest agree
             for _ in range(V - 1):
@@ -1251,7 +1344,7 @@ def main():
                     break
                 bobs[np.nonzero(bad)[0], worst[bad]] = np.nan
                 still = np.isfinite(bobs[:, 1:, 0]).any(1)
-                bobs, bside, Xb = bobs[still], bside[still], Xb[still]
+                bobs, bside, Xb, bidx = bobs[still], bside[still], Xb[still], bidx[still]
                 Xb = triangulate_multi(bobs, Rs, ts, cam)
             berr, bdok = reproj_errors(Xb, bobs, Rs, ts, cam)
             uvzb = to_page(F, Xb)
@@ -1263,7 +1356,7 @@ def main():
                     log(f"    side {sd}: {m.sum()} matched, depth ok {(bdok & m).sum()}, "
                         f"reproj ok {(m & (np.nanmax(berr, 1) < 1.5)).sum()}, dz ok {(m & (np.abs(dzb) < 8)).sum()}, "
                         f"dz median {np.median(np.abs(dzb[m])) if m.any() else 0:.1f} mm")
-            Xb, bside = Xb[okb], bside[okb]
+            Xb, bside, bidx = Xb[okb], bside[okb], bidx[okb]
         counts = np.bincount(bside, minlength=4) if len(Xb) else np.zeros(4, int)
         log(f"  outline points triangulated: top {counts[0]}, right {counts[1]}, "
             f"bottom {counts[2]}, left {counts[3]} (of {len(out0)})")
@@ -1302,6 +1395,9 @@ def main():
         gu, gv, Z, resid = fit_heightfield(data, bnd, args.grid, args.smooth, ruling_w=ruling_w)
         st, strain_med, strain_max = flatten_grid(gu, gv, Z)
         Xo, hit = ray_surface(rays_of(out0, cam), F, gu, gv, Z, c, n)
+        if len(Xb):
+            # where the outline was triangulated, its 3D position is measured
+            Xo[bidx], hit[bidx] = Xb, True
         uvo = to_page(F, Xo)
         sto = sample_grid2(st, gu, gv, uvo[:, 0], uvo[:, 1])
         use = hit & (side >= 0)
@@ -1315,32 +1411,87 @@ def main():
             uvz = to_page(F, X)
             rect = rect.copy(); rect[0] = 1.0
     st = xf(rect, st.reshape(-1, 2)).reshape(st.shape)
-    if not args.no_edge_fix:
-        # the outline seen in the photo is exact; force it onto the rectangle
-        sto_f = xf(rect, sto)
+    sto_f = xf(rect, sto)
+    if not (args.no_line_fix and args.no_edge_fix):
+        # One smooth correction of the flat map: the paper outline seen in the photo
+        # must lie on the rectangle, printed lines must be straight and axis-parallel,
+        # measured content should stay where the 3D reconstruction put it.
         okc = hit[cidx]
-        disp = edge_correction(sto_f[use], side[use], sto_f[cidx][okc], ctarget[okc], W, H)
-        # only where the surface is not backed by measured points (margins);
-        # the measured interior is trusted and stays untouched
-        # (outside the convex hull of the measured points, so holes in the content
-        # such as grey boxes are trusted like the text around them: no shear)
-        pst_m = sample_grid2(st, gu, gv, uvz[:, 0], uvz[:, 1])
-        hull = cv2.convexHull(pst_m.astype(np.float32))
-
-        def margin_w(q):
-            # 0 at the content boundary, rising linearly to 1 at the paper edge
-            dh = np.array([-cv2.pointPolygonTest(hull, (float(x), float(y)), True) for x, y in q])
-            de = np.minimum.reduce([q[:, 0], W - q[:, 0], q[:, 1], H - q[:, 1]])
-            dh, de = np.maximum(dh, 0), np.maximum(de, 0)
-            return np.where(dh > 0, dh / (dh + de + 1e-6), 0.0)[:, None]
-
-        flat_st = st.reshape(-1, 2)
-        st = (flat_st + margin_w(flat_st) * disp(flat_st)).reshape(st.shape)
-        after = sto_f[use] + margin_w(sto_f[use]) * disp(sto_f[use])
-        ax = np.array([1, 0, 1, 0])[side[use]]
-        tg = np.array([0.0, W, H, 0.0])[side[use]]
-        rr = after[np.arange(len(after)), ax] - tg
-        log(f"  edge correction: outline rms {np.sqrt(np.mean(rres ** 2)):.3f} -> {np.sqrt(np.mean(rr ** 2)):.3f} mm")
+        edges = []
+        if not args.no_edge_fix:
+            # Outline points must agree with their neighbours along the edge: a smooth
+            # offset of a whole edge is real (extrapolated margin) and gets corrected,
+            # isolated jumps are detection errors (shadows, background) and are dropped.
+            edge_fit = {}
+            for sd, ax, tg in ((3, 0, 0.0), (1, 0, W), (0, 1, 0.0), (2, 1, H)):
+                m = use & (side == sd)
+                if m.sum() < 10:
+                    continue
+                P_ = sto_f[m]
+                along = P_[:, 1 - ax]
+                r = tg - P_[:, ax]
+                ok = np.abs(r) < 25.0
+                for _ in range(3):
+                    cf = np.polyfit(along[ok], r[ok], 2)
+                    dev = r - np.polyval(cf, along)
+                    mad = 1.4826 * np.median(np.abs(dev[ok])) + 1e-6
+                    ok = (np.abs(r) < 25.0) & (np.abs(dev) < max(1.0, 4 * mad))
+                edge_fit[sd] = (ax, cf)
+                edges.append((P_[ok], ax, tg))
+                if os.environ.get("BA_DEBUG"):
+                    np.savez(os.path.join(args.out, f"dbg_edge{sd}.npz"), img=out0[m], uvo=uvo[m], st=P_, r=r, ok=ok)
+                log(f"    edge {('top', 'right', 'bottom', 'left')[sd]}: offset median {np.median(r):+.2f} mm, "
+                    f"range {np.percentile(r, 5):+.2f}..{np.percentile(r, 95):+.2f}, kept {ok.sum()}/{len(r)}")
+            # corners: keep only if consistent with both adjacent edge fits
+            Pc, Tc = sto_f[cidx], ctarget
+            for ax in (0, 1):
+                keepc = okc.copy()
+                for k in range(4):
+                    for sd, (eax, cf) in edge_fit.items():
+                        if eax == ax and abs(Tc[k, ax] - (0.0 if sd in (3, 0) else (W if sd == 1 else H))) < 1e-6:
+                            pred = np.polyval(cf, Pc[k, 1 - ax])
+                            if abs((Tc[k, ax] - Pc[k, ax]) - pred) > 3.0:
+                                keepc[k] = False
+                edges.append((Pc[keepc], ax, Tc[keepc][:, ax]))
+        anchors = sample_grid2(st, gu, gv, uvz[:, 0], uvz[:, 1])
+        if len(anchors) > 4000:
+            anchors = anchors[np.random.default_rng(0).choice(len(anchors), 4000, replace=False)]
+        camp = dict(cam, f=cam["f"] / s, cx=(cam["cx"] + 0.5) / s - 0.5, cy=(cam["cy"] + 0.5) / s - 0.5)
+        no_lines = (np.empty((0, 4)), np.empty(0, bool))
+        # 1) edges: measured content holds firmly, so the correction stays in the margins
+        if edges:
+            disp_e = fit_correction(W, H, edges, no_lines, anchors, w_anchor=1.0)
+            st = st + disp_e(st.reshape(-1, 2)).reshape(st.shape)
+            sto_f = sto_f + disp_e(sto_f)
+            anchors = anchors + disp_e(anchors)
+            dd = np.linalg.norm(disp_e(anchors), axis=1)
+            log(f"  edge correction: shift at measured content median {np.median(dd):.3f} mm")
+        # 2) lines: printed lines may override the measurement (weak hold); the
+        #    corrected outline stays where it is
+        if not args.no_line_fix:
+            hold = [(sto_f[use], 0, sto_f[use][:, 0]), (sto_f[use], 1, sto_f[use][:, 1])] if edges else []
+            st1, sto1 = st.copy(), sto_f.copy()
+            disp_l = None
+            for it in range(2):
+                inv0 = flat_to_uv(st, gu, gv, W, H)
+                Xp_, shp, _, _, page_p = flat_geometry(camp, F, gu, gv, Z, W, H, 150, inv0)
+                g8 = np.clip(render_view(fulls[0], Xp_, shp, camp, Rs[0], ts[0])[0].mean(2), 0, 255).astype(np.uint8)
+                g8[~page_p] = 255
+                Lc, hz = detect_lines(g8, W, H)
+                if disp_l is not None and len(Lc):
+                    back = lambda P: P - disp_l(P)
+                    Lc = np.c_[back(Lc[:, :2]), back(Lc[:, 2:])]
+                disp_l = fit_correction(W, H, hold, (Lc, hz), anchors, w_anchor=args.anchor_w)
+                st = st1 + disp_l(st1.reshape(-1, 2)).reshape(st1.shape)
+                sto_f = sto1 + disp_l(sto1)
+                dd = np.linalg.norm(disp_l(st1.reshape(-1, 2)), axis=1)
+                log(f"  line correction {it + 1}: {len(Lc)} line segments, shift median {np.median(dd):.3f} mm, "
+                    f"max {dd.max():.2f} mm")
+        if not args.no_edge_fix:
+            ax_ = np.array([1, 0, 1, 0])[side[use]]
+            tg_ = np.array([0.0, W, H, 0.0])[side[use]]
+            rr = sto_f[use][np.arange(use.sum()), ax_] - tg_
+            log(f"  outline on rectangle: rms {np.sqrt(np.mean(rres ** 2)):.3f} -> {np.sqrt(np.mean(rr ** 2)):.3f} mm")
     outline_rms = float(np.sqrt(np.mean(rres ** 2)))
     pst = sample_grid2(st, gu, gv, uvz[:, 0], uvz[:, 1])
     log(f"  z range {uvz[:, 2].min():.2f} .. {uvz[:, 2].max():.2f} mm, "

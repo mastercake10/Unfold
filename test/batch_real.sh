@@ -10,7 +10,8 @@ for i in 1 2 3 4 5; do
   if python3 "$here/../docscan3d.py" $imgs -o "$o" "$@" > "$o.log" 2>&1; then
     r=$(python3 "$here/eval_real.py" "$o/flat.png" "$dir/scan$i.jpg" --scan-dpi $dpi --json)
     f=$(python3 -c "import json;r=json.load(open('$o/report.json'));print(f\"{r['focal_px']:.0f} {r['reproj_rms_px']:.3f} {r['outline_fit_rms_mm']:.2f} {r['outline_points']}\")")
-    echo "$i $tag $f $r"
+    l=$(python3 "$here/eval_lines.py" "$o/flat.png" --json | python3 -c "import json,sys;r=json.load(sys.stdin);print(f\"lines {r['axis_025']*100:.1f}%\")")
+    echo "$i $tag $f $l $r"
   else
     echo "$i $tag FAIL $(tail -1 $o.log)"
   fi

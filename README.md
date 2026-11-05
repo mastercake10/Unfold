@@ -77,12 +77,27 @@ Extreme fold (2 views, ~45° creases, downscaled chat photos): 0.34 mm median, p
 - Fold prior: if the surface bends in one direction only (parallel letter folds), the frame
   is turned along the folds and the paper is kept straight along them (`--ruling`, 1 = off).
   This also helps normal letters; curls and diagonal folds keep the isotropic model.
-- Edge correction: the page outline seen in the photo is exact, so the flattened outline is
-  forced onto the rectangle. The correction acts only in the margins outside the measured
-  content (rising from 0 at the content boundary to 1 at the paper edge), so the measured
-  interior and printed areas without points (grey boxes) are not sheared (`--no-edge-fix`).
+- Map corrections after flattening, as smooth displacement fields on the flat page:
+  1. edges: the page outline seen in the photo is exact, so it is put on the rectangle; measured
+     content holds firmly, so the correction stays in the margins (`--no-edge-fix`);
+  2. lines: printed near-horizontal/vertical lines (LSD in a provisional render) must be straight
+     and axis-parallel; measured content holds only weakly (`--anchor-w`), the outline stays put
+     (`--no-line-fix`). This fixes regions the 3D measurement could not cover, e.g. tables whose
+     identical rows defeat feature matching.
+- Where the page outline was triangulated, its measured 3D position is used directly; otherwise
+  the ray is intersected with the surface, taking the crossing nearest the expected depth.
 - Photos with almost no viewpoint change (or the same image twice) stop with a clear message.
 - The height-field extent follows the data (steeply folded pages do not sit at 0..W x 0..H).
+
+## Scan-free line metric
+
+`test/eval_lines.py flat.png [--hist h.png --vis v.jpg]` scores how much printed line length is
+within 0.25 deg of horizontal/vertical (after removing the global rotation), RMS angle, and bend
+of long rules. Reference: the flatbed scans score 69-98 %.
+
+Note on the scans: they are sheared by 0.4-0.6 deg (vertical vs. horizontal lines) and have their
+own x/y scale error, so `eval_real.py` now registers with a full affine transform (`--similarity`
+for the old behaviour). Global geometry is checked by the A4 outline and the line metric instead.
 
 ## Synthetic test
 

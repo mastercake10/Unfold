@@ -27,7 +27,8 @@ def homography_flat(photo, W, H, dpi):
     return cv2.warpPerspective(img, M, (ow, oh), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
 
 
-def compare(flat, scan, scan_dpi, page_w_mm, vis_path=None, max_err_mm=6.0, return_transform=False):
+def compare(flat, scan, scan_dpi, page_w_mm, vis_path=None, max_err_mm=6.0, return_transform=False,
+            similarity=False):
     mm_per_px = page_w_mm / flat.shape[1]
     s = (25.4 / scan_dpi) / mm_per_px
     scan = cv2.resize(scan, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
@@ -45,9 +46,11 @@ def compare(flat, scan, scan_dpi, page_w_mm, vis_path=None, max_err_mm=6.0, retu
     M, inl = cv2.estimateAffinePartial2D(a, b, method=cv2.RANSAC, ransacReprojThreshold=max_err_mm / mm_per_px,
                                          maxIters=20000, confidence=0.999)
     a, b = a[inl.ravel() > 0], b[inl.ravel() > 0]
-    # refit on inliers by least squares, then robust trimming of gross mismatches
+    # refit on inliers, then robust trimming of gross mismatches. Full affine: flatbed and
+    # sheet-fed scans carry their own shear (~0.5 deg measured) and x/y scale error.
+    fit = cv2.estimateAffinePartial2D if similarity else cv2.estimateAffine2D
     for _ in range(3):
-        M, _ = cv2.estimateAffinePartial2D(a, b, method=cv2.LMEDS)
+        M, _ = fit(a, b, method=cv2.LMEDS)
         r = np.linalg.norm(a @ M[:, :2].T + M[:, 2] - b, axis=1) * mm_per_px
         keep = r < max(3 * np.median(r) * 1.4826 + 0.3, 1.0)
         a, b = a[keep], b[keep]
@@ -91,6 +94,7 @@ def main():
     ap.add_argument("--page-w", type=float, default=210)
     ap.add_argument("--page-h", type=float, default=297)
     ap.add_argument("--homography", action="store_true", help="first flatten the photo with a 4-corner homography")
+    ap.add_argument("--similarity", action="store_true", help="old behaviour: rotation/scale/shift only")
     ap.add_argument("--vis")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
@@ -98,7 +102,7 @@ def main():
         flat = homography_flat(args.flat, args.page_w, args.page_h, 200)
     else:
         flat = cv2.imread(args.flat)
-    res = compare(flat, cv2.imread(args.scan), args.scan_dpi, args.page_w, args.vis)
+    res = compare(flat, cv2.imread(args.scan), args.scan_dpi, args.page_w, args.vis, similarity=args.similarity)
     if args.json:
         print(json.dumps(res))
     else:
