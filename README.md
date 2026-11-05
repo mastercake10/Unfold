@@ -39,7 +39,7 @@ The first image is the reference that gets rendered. With 4 views the focal leng
 | `points.ply` | same points in page frame, colored |
 | `heightfield.npz` | grid `u`, `v`, `z`, unrolled grid `st`, camera `K`, `R`, `t`, page frame |
 | `heightfield.png` | fitted height map + measured points |
-| `flat.png` | flattened page at `--dpi` (default 200), shading removed |
+| `flat.png` | flattened page at `--dpi` (default 200), shading removed, paper cleaned (grey PNG if no colour) |
 | `flat_raw.png` | same, original illumination |
 | `overlay.jpg` | view 1 with detected page and points colored by height |
 | `report.json` | point count, reprojection error, baseline, distance, strain, ... |
@@ -56,6 +56,14 @@ gain and slightly worse geometry, so it is off by default.
 Paper non-uniformity vs. the raw render (`test/eval_photo.py`, on scan-defined paper areas):
 sample 1 10.6 % → 3.0 %, 2 8.2 % → 5.5 % (rest is show-through from the printed back side),
 4 6.4 % → 2.3 %, 5 7.0 % → 1.4 %; edge sharpness unchanged.
+
+Paper cleanup (default, `--no-clean` to skip): denoise (non-local means), even out small
+paper-level variations (texture, faint show-through) while larger deviations such as printed
+grey fills stay, then a ramp pushes the paper to white. Pages without real colour are written
+as single-channel PNG. On the 5 samples: 4.6 MB → ~0.6 MB per page, edge sharpness vs. scan
+0.889 → 0.907, local NCC to scan 0.570 → 0.600. Geometry is not touched; note that
+`eval_real.py` (CLAHE + SIFT) reacts to image tone, so its numbers move by up to ~0.02 mm
+median / ~0.15 mm p95 per sample on identical geometry. Compare geometry with `--no-clean`.
 
 ## Real-photo results (Pixel 8, 5 folded letters, vs. flatbed scan)
 

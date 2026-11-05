@@ -1010,6 +1010,44 @@ def to_uint8(alb, white=0.95):
     return np.clip((gray + chroma * keep) * 255 * white, 0, 255).astype(np.uint8)
 
 
+def clean_paper(img, nlm_h=4.0, near=0.10):
+    """Scanner-like paper: denoise, even out small paper-level variations (texture,
+    show-through), then push the paper to white with a ramp (not a hard clip, so the
+    bright side of edges keeps its gradient). Larger deviations such as printed grey
+    areas are left alone. Pages without real colour come back single-channel."""
+    gray = img.mean(2)
+    chroma = np.abs(img.astype(np.float32) - gray[..., None]).max(2)
+    colour = (cv2.medianBlur((chroma > 15).astype(np.uint8), 5).mean() > 1e-3)
+    g = cv2.fastNlMeansDenoising(np.clip(gray, 0, 255).astype(np.uint8), None, nlm_h, 7, 21).astype(np.float32)
+
+    def paper_level(x):
+        x8 = np.clip(x, 0, 255).astype(np.uint8)
+        bg = cv2.medianBlur(x8, 21)
+        p = (bg > 180) & (np.abs(x8.astype(np.int16) - bg) < 25)
+        if p.sum() < 1000:
+            return None
+        P = float(np.median(x[p]))
+        return P, 1.4826 * float(np.median(np.abs(x[p] - P)))
+
+    st = paper_level(g)
+    if st is None:
+        return img if colour else np.clip(gray, 0, 255).astype(np.uint8)
+    # local paper level: ink removed by a closing, then smoothed
+    bg = cv2.GaussianBlur(cv2.morphologyEx(g, cv2.MORPH_CLOSE,
+                                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))), (0, 0), 6.0)
+    ratio = bg / st[0]
+    w = np.clip((ratio - (1 - near)) / (near / 2), 0, 1)
+    e = g * (1 + w * (1 / np.maximum(ratio, 1e-3) - 1))
+    P, s = paper_level(e) or st
+    s = max(s, 2.0)
+    lo, hi = P - 4 * s - 4, P - s
+    y = np.where(e <= lo, e, lo + (e - lo) * (255 - lo) / max(hi - lo, 1e-3))
+    y = np.clip(y, 0, 255)
+    if not colour:
+        return y.astype(np.uint8)
+    return np.clip(img * (y / np.maximum(gray, 1.0))[..., None], 0, 255).astype(np.uint8)
+
+
 def tilt_sims(g, mask, tilts, sift):
     """ASIFT-style affine simulations: keypoints of tilted/rotated copies of the
     image, mapped back to original coordinates."""
@@ -1156,6 +1194,8 @@ def main():
                     help="do not straighten printed horizontal/vertical lines")
     ap.add_argument("--anchor-w", type=float, default=0.1,
                     help="how strongly measured content resists the edge/line correction")
+    ap.add_argument("--no-clean", action="store_true",
+                    help="keep paper grain and colour in flat.png (no denoise / white paper)")
     ap.add_argument("--no-edge-fix", action="store_true",
                     help="do not force the detected page outline onto the rectangle")
     ap.add_argument("--fuse", action="store_true",
@@ -1578,7 +1618,10 @@ def main():
         flat = fuse_views(albs, [r[1] & page for r in rend], [r[2] for r in rend])
     else:
         flat = albs[0]
-    cv2.imwrite(os.path.join(args.out, "flat.png"), to_uint8(flat))
+    out8 = to_uint8(flat)
+    if not args.no_clean:
+        out8 = clean_paper(out8)
+    cv2.imwrite(os.path.join(args.out, "flat.png"), out8, [cv2.IMWRITE_PNG_COMPRESSION, 9])
 
     report = dict(views=V, points=int(len(X)), outline_points=int(len(Xb)),
                   focal_px=float(camf["f"]), focal_source=ksrc, k1=cam["k1"], k2=cam["k2"],

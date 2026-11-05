@@ -31,11 +31,13 @@ def main():
     ap.add_argument("images", nargs="+")
     ap.add_argument("-o", "--output", default="flat_rerender.png")
     ap.add_argument("--fuse", action="store_true")
+    ap.add_argument("--no-clean", action="store_true")
     a = ap.parse_args()
     rend, nu, nv, page = load(a.out_dir, a.images if a.fuse else a.images[:1])
     albs = [d.remove_shading(r[0], r[1] & page, nu, nv) for r in rend]
     flat = d.fuse_views(albs, [r[1] & page for r in rend], [r[2] for r in rend]) if len(rend) > 1 else albs[0]
-    cv2.imwrite(a.output, d.to_uint8(flat))
+    out8 = d.to_uint8(flat)
+    cv2.imwrite(a.output, out8 if a.no_clean else d.clean_paper(out8))
 
 
 if __name__ == "__main__":
