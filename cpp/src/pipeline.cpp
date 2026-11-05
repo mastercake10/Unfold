@@ -788,12 +788,14 @@ cv::Mat Session::Impl::correct_render(Flat& fl) const {
             std::vector<Eigen::Vector4d> segs;
             std::vector<char> hz;
             cv::Mat g8 = gray_u8(R.img, R.page);
-            detect_lines(g8, W, H, segs, hz);
             std::vector<Pts2> text, text_v;
-            if (text_lines) {
-                text = detect_text_lines(g8, W, H);
-                text_v = detect_text_lines(g8, W, H, true);
-            }
+            parallel_for(cv::Range(0, text_lines ? 3 : 1), [&](const cv::Range& rg) {
+                for (int k = rg.start; k < rg.end; k++) {
+                    if (k == 0) detect_lines(g8, W, H, segs, hz);
+                    if (k == 1) text = detect_text_lines(g8, W, H);
+                    if (k == 2) text_v = detect_text_lines(g8, W, H, true);
+                }
+            });
             if (have) {
                 for (auto& sg : segs) {
                     Vec2 a = sg.head<2>(), b = sg.tail<2>();
