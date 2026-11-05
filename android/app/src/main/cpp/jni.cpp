@@ -112,9 +112,11 @@ extern "C" JNIEXPORT void JNICALL Java_de_spaceio_docscan_Native_reset(JNIEnv*, 
 
 // 3D surface, unrolling and rendering from the added photos; writes a PNG.
 // Returns null on success, else the error message.
-extern "C" JNIEXPORT jstring JNICALL Java_de_spaceio_docscan_Native_finish(JNIEnv* env, jclass, jstring jout) {
+extern "C" JNIEXPORT jstring JNICALL Java_de_spaceio_docscan_Native_finish(JNIEnv* env, jclass, jstring jout,
+                                                                           jboolean doc_tone) {
     if (!session || session->size() < 1) return env->NewStringUTF("no photo");
     try {
+        session->set_doc_tone(doc_tone);
         double w0 = wall_seconds(), c0 = cpu_seconds();
         cv::Mat flat = session->finish();
         docscan::log("  3D + rendering: " + usage(w0, c0));

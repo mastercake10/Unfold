@@ -24,9 +24,12 @@ object Native {
     @JvmStatic
     external fun reset()
 
-    /** Computes the flat page from the added photos and writes a PNG. Null on success, else the error. */
+    /**
+     * Computes the flat page from the added photos and writes a PNG. Null on success, else the error.
+     * docTone: ink to black and light grey to white (cleaner, but fades light grey print).
+     */
     @JvmStatic
-    external fun finish(outPath: String): String?
+    external fun finish(outPath: String, docTone: Boolean): String?
 
     /** Last progress message. */
     @JvmStatic

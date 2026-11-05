@@ -21,6 +21,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -128,7 +129,12 @@ fun CaptureScreen(model: ScanModel) {
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
             )
         }
-        if (model.pending > 0) {
+        if (busy) {
+            Text(
+                "focusing and taking the photo …", color = Color.Gray, fontSize = 13.sp,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+        } else if (model.pending > 0) {
             Text(
                 "analysing photo …", color = Color.Gray, fontSize = 13.sp,
                 modifier = Modifier.padding(horizontal = 16.dp),
@@ -136,13 +142,22 @@ fun CaptureScreen(model: ScanModel) {
         }
         Spacer(Modifier.weight(1f))
         Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Clean look", color = Color.White, fontSize = 15.sp)
+                Text("black text on white; turn off for light grey print", color = Color.Gray, fontSize = 12.sp)
+            }
+            Switch(checked = model.docTone, onCheckedChange = { model.changeDocTone(it) })
+        }
+        Row(
             Modifier.fillMaxWidth().padding(bottom = 24.dp),
             horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically,
         ) {
             OutlinedButton(onClick = { model.undo() }, enabled = n > 0 && !busy) { Text("Retake") }
             Box(
-                Modifier.size(76.dp).clip(CircleShape).border(4.dp, Color.White, CircleShape).padding(8.dp)
-                    .clip(CircleShape).background(if (busy || n >= STEPS.size) Color.Gray else Color.White)
+                Modifier.size(76.dp).clip(CircleShape)
                     .clickable(enabled = !busy && n < STEPS.size) {
                         busy = true
                         val file = model.nextShotFile()
@@ -156,6 +171,9 @@ fun CaptureScreen(model: ScanModel) {
                             }
                         }
                     }
+                    // the whole button reacts, including the outer ring
+                    .border(4.dp, Color.White, CircleShape).padding(8.dp)
+                    .clip(CircleShape).background(if (busy || n >= STEPS.size) Color.Gray else Color.White)
             )
             Button(onClick = { model.process() }, enabled = n >= 1 && !busy) { Text("Process") }
         }

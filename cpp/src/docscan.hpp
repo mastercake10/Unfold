@@ -46,6 +46,8 @@ public:
     // 3D surface, unrolling, rendering. Photos that turn out unusable here are left out.
     // Throws std::runtime_error.
     cv::Mat finish();
+    // Options::doc_tone for the next finish().
+    void set_doc_tone(bool on);
 
     struct Impl;
     std::unique_ptr<Impl> p;

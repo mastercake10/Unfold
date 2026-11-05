@@ -51,6 +51,8 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
     private var early: File? = null
     private var earlyErr: String? = null
     private var earlyFor: File? = null
+    private var earlyTone = true
+    private val prefs = app.getSharedPreferences("docscan", android.content.Context.MODE_PRIVATE)
     private var counter = 0
 
     val shots = mutableStateListOf<File>()
@@ -63,6 +65,24 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
         private set
     /** Why the last photo was rejected (shown on the camera screen until the next photo). */
     var notice by mutableStateOf<String?>(null)
+    /** Clean look: ink to black, light grey to white (better OCR on most letters, fades light grey print). */
+    var docTone by mutableStateOf(prefs.getBoolean("docTone", true))
+        private set
+
+    fun changeDocTone(on: Boolean) {
+        docTone = on
+        prefs.edit().putBoolean("docTone", on).apply()
+        // redo the early one-photo result with the new look
+        worker.execute { if (accepted.size == 1 && early != null && earlyTone != on) makeEarly(accepted[0], on) }
+    }
+
+    private fun makeEarly(f: File, tone: Boolean) {
+        val out = File(outDir, "early.png")
+        earlyErr = Native.finish(out.path, tone)
+        early = out
+        earlyFor = f
+        earlyTone = tone
+    }
 
     init {
         worker.execute { Native.warmup() }
@@ -88,12 +108,7 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
                     notice = "$err\nPlease take this photo again."
                 }
             }
-            if (err == null && accepted.size == 1) {
-                val out = File(outDir, "early.png")
-                earlyErr = Native.finish(out.path)
-                early = out
-                earlyFor = f
-            }
+            if (err == null && accepted.size == 1) makeEarly(f, docTone)
         }
     }
 
@@ -130,13 +145,14 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val out = File(outDir, "docscan_$stamp.png")
         val t0 = SystemClock.elapsedRealtime()  // what the user waits for, including photos still in analysis
+        val tone = docTone
         worker.execute {
             val e = early
             val err = when {
                 accepted.isEmpty() -> "No usable photo."
-                accepted.size == 1 && e != null && earlyFor == accepted[0] ->
-                    earlyErr ?: if (e.renameTo(out)) null else Native.finish(out.path)
-                else -> Native.finish(out.path)
+                accepted.size == 1 && e != null && earlyFor == accepted[0] && earlyTone == tone ->
+                    earlyErr ?: if (e.renameTo(out)) null else Native.finish(out.path, tone)
+                else -> Native.finish(out.path, tone)
             }
             early = null
             val sec = (SystemClock.elapsedRealtime() - t0) / 1000.0

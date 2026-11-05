@@ -15,6 +15,8 @@ flat page is saved to `Pictures/DocScan` or shared (e.g. to the Paperless app).
 - The output is turned so the text is upright.
 - The 3D part runs on photos downscaled to 3200 px (same page pixels/mm as the full-size 16:9
   photos the pipeline was tuned on); the page is rendered from the full-size first photo.
+- "Clean look" switch (on by default, remembered): black text on white paper (`Options::doc_tone`);
+  turn it off for pages with light grey print, which it fades.
 - "Send report" shares the photos and the timed log (`log.txt`) for debugging.
 - Output: A4, 200 dpi PNG. arm64-v8a only.
 

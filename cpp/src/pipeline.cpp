@@ -269,6 +269,8 @@ void Session::remove_last() {
     }
 }
 
+void Session::set_doc_tone(bool on) { p->opt.doc_tone = on; }
+
 cv::Mat Session::finish() {
     std::vector<int> use;
     for (int j = 0; j < size(); j++) use.push_back(j);

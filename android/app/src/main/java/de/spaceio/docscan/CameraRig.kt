@@ -142,7 +142,21 @@ class CameraRig(private val context: Context) {
      * Takes a photo into [file]. For the first photo ([lockAfter]) autofocus runs on the page centre
      * first and focus is locked afterwards.
      */
-    fun shoot(file: File, lockAfter: Boolean, done: (Result<Size>) -> Unit) {
+    fun shoot(file: File, lockAfter: Boolean, done0: (Result<Size>) -> Unit) {
+        // report once; if the camera never answers, give the shutter back after a while
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        var reported = false
+        val done = { r: Result<Size> ->
+            if (!reported) {
+                reported = true
+                handler.removeCallbacksAndMessages(null)
+                done0(r)
+            }
+        }
+        handler.postDelayed({
+            Log.w("docscan", "photo: no answer from the camera")
+            done(Result.failure(IllegalStateException("the camera did not respond, please try again")))
+        }, 8000)
         val cam = camera ?: return done(Result.failure(IllegalStateException("camera not ready")))
         val cap = capture ?: return done(Result.failure(IllegalStateException("camera not ready")))
         val main = ContextCompat.getMainExecutor(context)
@@ -166,7 +180,7 @@ class CameraRig(private val context: Context) {
         }
         val point = SurfaceOrientedMeteringPointFactory(1f, 1f).createPoint(0.5f, 0.5f)
         val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-            .setAutoCancelDuration(5, TimeUnit.SECONDS).build()
+            .setAutoCancelDuration(3, TimeUnit.SECONDS).build()
         val f = cam.cameraControl.startFocusAndMetering(action)
         f.addListener({ take() }, main)  // take the photo even if focusing failed
     }
