@@ -77,6 +77,11 @@ Extreme fold (2 views, ~45° creases, downscaled chat photos): 0.34 mm median, p
 - Fold prior: if the surface bends in one direction only (parallel letter folds), the frame
   is turned along the folds and the paper is kept straight along them (`--ruling`, 1 = off).
   This also helps normal letters; curls and diagonal folds keep the isotropic model.
+- Edge correction: the page outline seen in the photo is exact, so the flattened outline is
+  forced onto the rectangle. The correction acts only in the margins outside the measured
+  content (rising from 0 at the content boundary to 1 at the paper edge), so the measured
+  interior and printed areas without points (grey boxes) are not sheared (`--no-edge-fix`).
+- Photos with almost no viewpoint change (or the same image twice) stop with a clear message.
 - The height-field extent follows the data (steeply folded pages do not sit at 0..W x 0..H).
 
 ## Synthetic test

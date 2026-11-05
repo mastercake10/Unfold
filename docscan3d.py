@@ -638,6 +638,29 @@ def fit_rectangle(st, side, W, H, x0):
     return res.x, xf, r
 
 
+def edge_correction(st_o, side, st_c, ctarget, W, H, max_mm=6.0):
+    """Smooth displacement fields that put the flattened outline exactly on the
+    rectangle: s-shifts from the left/right edges, t-shifts from top/bottom,
+    both from the corners. Thin-plate splines fade them into the interior;
+    nothing is imposed along an edge (tangential direction)."""
+    from scipy.interpolate import RBFInterpolator
+    fields = []
+    for axis, sides, targets in ((0, (3, 1), (0.0, W)), (1, (0, 2), (0.0, H))):
+        P, D = [st_c], [ctarget[:, axis] - st_c[:, axis]]
+        for sd, tg in zip(sides, targets):
+            m = side == sd
+            if m.sum() < 5:
+                continue
+            pts = st_o[m]
+            if len(pts) > 150:
+                pts = pts[np.linspace(0, len(pts) - 1, 150).astype(int)]
+            P.append(pts)
+            D.append(tg - pts[:, axis])
+        P, D = np.concatenate(P), np.clip(np.concatenate(D), -max_mm, max_mm)
+        fields.append(RBFInterpolator(P, D, kernel="thin_plate_spline", smoothing=1.0))
+    return lambda q: np.stack([f(q) for f in fields], -1)
+
+
 def corners_init(st_c, dst):
     a, b = st_c - st_c.mean(0), dst - dst.mean(0)
     U_, _, Vt = np.linalg.svd(b.T @ a)
@@ -938,6 +961,16 @@ def page_coverage(pts, mask, n=8):
     return hit / max(cells, 1)
 
 
+def parallax_deg(q0, qj, R, cam):
+    """Median angle between corresponding rays after removing the rotation:
+    ~0 when the camera did not move (no depth information)."""
+    d0 = rays_of(q0, cam)
+    dj = rays_of(qj, cam) @ R
+    d0 /= np.linalg.norm(d0, axis=1, keepdims=True)
+    dj /= np.linalg.norm(dj, axis=1, keepdims=True)
+    return float(np.degrees(np.median(np.arccos(np.clip((d0 * dj).sum(1), -1, 1)))))
+
+
 def match_ref(kp0, d0, g, mask, n_features):
     sift = cv2.SIFT_create(nfeatures=n_features, contrastThreshold=0.02)
     kp, d = sift.detectAndCompute(g, mask)
@@ -1011,6 +1044,8 @@ def main():
     ap.add_argument("--dpi", type=int, default=200, help="dpi of the flattened output")
     ap.add_argument("--no-densify", action="store_true")
     ap.add_argument("--no-outline", action="store_true", help="do not triangulate the page outline")
+    ap.add_argument("--no-edge-fix", action="store_true",
+                    help="do not force the detected page outline onto the rectangle")
     ap.add_argument("--fuse", action="store_true",
                     help="blend all views (against glare/shadows in single shots; may soften geometry slightly)")
     ap.add_argument("--no-shading", action="store_true", help="keep the original illumination")
@@ -1099,7 +1134,14 @@ def main():
             inl = inl.ravel().astype(bool)
             q0, qj = q0[inl], qj[inl]
             used_asift = True
+        if E is None or len(q0) < 8:
+            sys.exit(f"view {j}: no usable matches with the reference view")
+        E = E[:3]  # degenerate input can return several stacked solutions
         _, R, t, _ = cv2.recoverPose(E, q0, qj, Ks)
+        par = parallax_deg(q0, qj, R, cam)
+        if par < 1.5:
+            sys.exit(f"view {j}: almost no viewpoint change between the photos (parallax {par:.2f} deg). "
+                     "Move the phone 10-20 cm between shots, and check that two different images were passed.")
         A, _ = local_affines(q0, qj)
         pr, ok = refine_subpixel(gs[0], gs[j], q0, qj, A)
         ok &= np.linalg.norm(pr - qj, axis=1) < (3.0 if used_asift else 1.5)
@@ -1142,6 +1184,8 @@ def main():
         cam, Rs, ts = bundle_adjust(cam, Rs, ts, obs[sel], not args.fixed_focal, n_dist)
         X = triangulate_multi(obs, Rs, ts, cam)
         X, obs, err = clean_obs(X, obs, Rs, ts, cam, 1.0 if it else 2.0)
+    if len(X) < 50:
+        sys.exit(f"only {len(X)} reliable 3D points; the photos do not overlap or differ too little in viewpoint")
     rms = np.sqrt(np.nanmean(err ** 2))
     cams_c = [-R.T @ t for R, t in zip(Rs, ts)]
     log(f"  points {len(X)}, reprojection rms {rms:.3f} px, focal {cam['f'] / s:.1f} px, "
@@ -1271,6 +1315,32 @@ def main():
             uvz = to_page(F, X)
             rect = rect.copy(); rect[0] = 1.0
     st = xf(rect, st.reshape(-1, 2)).reshape(st.shape)
+    if not args.no_edge_fix:
+        # the outline seen in the photo is exact; force it onto the rectangle
+        sto_f = xf(rect, sto)
+        okc = hit[cidx]
+        disp = edge_correction(sto_f[use], side[use], sto_f[cidx][okc], ctarget[okc], W, H)
+        # only where the surface is not backed by measured points (margins);
+        # the measured interior is trusted and stays untouched
+        # (outside the convex hull of the measured points, so holes in the content
+        # such as grey boxes are trusted like the text around them: no shear)
+        pst_m = sample_grid2(st, gu, gv, uvz[:, 0], uvz[:, 1])
+        hull = cv2.convexHull(pst_m.astype(np.float32))
+
+        def margin_w(q):
+            # 0 at the content boundary, rising linearly to 1 at the paper edge
+            dh = np.array([-cv2.pointPolygonTest(hull, (float(x), float(y)), True) for x, y in q])
+            de = np.minimum.reduce([q[:, 0], W - q[:, 0], q[:, 1], H - q[:, 1]])
+            dh, de = np.maximum(dh, 0), np.maximum(de, 0)
+            return np.where(dh > 0, dh / (dh + de + 1e-6), 0.0)[:, None]
+
+        flat_st = st.reshape(-1, 2)
+        st = (flat_st + margin_w(flat_st) * disp(flat_st)).reshape(st.shape)
+        after = sto_f[use] + margin_w(sto_f[use]) * disp(sto_f[use])
+        ax = np.array([1, 0, 1, 0])[side[use]]
+        tg = np.array([0.0, W, H, 0.0])[side[use]]
+        rr = after[np.arange(len(after)), ax] - tg
+        log(f"  edge correction: outline rms {np.sqrt(np.mean(rres ** 2)):.3f} -> {np.sqrt(np.mean(rr ** 2)):.3f} mm")
     outline_rms = float(np.sqrt(np.mean(rres ** 2)))
     pst = sample_grid2(st, gu, gv, uvz[:, 0], uvz[:, 1])
     log(f"  z range {uvz[:, 2].min():.2f} .. {uvz[:, 2].max():.2f} mm, "
