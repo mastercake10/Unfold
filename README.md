@@ -73,8 +73,14 @@ image 2× internally, ~2 GB on a full photo otherwise), rendering works in row s
 the views that are still needed are kept in memory. `--minimal` skips the debug outputs (`points.ply`,
 `heightfield.png`, `overlay.jpg`, `flat_raw.png`).
 
-On the 5 samples (4 views, 16 threads): 124 s → 84 s total (~15–19 s per page), peak memory
-2.35 GB → ~1.1 GB. 2 views: 57 s → 52 s.
+The bundle adjustment uses an exact Jacobian (points are re-triangulated inside, so this
+includes the derivative of the triangulation), the unrolling a Gauss-Newton solve with a direct
+sparse factorization. Random steps (FLANN, MAGSAC) are seeded per view, so results do not depend
+on the thread count; the essential matrix is estimated up to 4 times and the model with the most
+inliers in front of both cameras is kept (a single MAGSAC run occasionally returned a wrong pose).
+
+On the 5 samples (4 views, 16 threads): 124 s → 75 s total (~13–17 s per page), peak memory
+2.35 GB → ~1.1 GB. 2 views: 57 s → 48 s.
 
 ## Real-photo results (Pixel 8, 5 folded letters, vs. flatbed scan)
 

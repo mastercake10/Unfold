@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 from scipy import sparse
 from scipy.optimize import least_squares
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import splu, spsolve
 
 
 def log(*a):
@@ -377,13 +377,87 @@ def bundle_adjust(cam, Rs, ts, obs, refine_f, n_dist, max_nfev=200):
             r.append(d.ravel())
         return np.r_[np.concatenate(r), 1e3 * (np.linalg.norm(tv[1]) - t1n) / t1n]
 
+    def jac(x):
+        """Exact Jacobian of resid (no distortion). The points X solve M X = b with
+        M = sum a a^T, b = -sum a c over the triangulation rows; differentiating gives
+        M dX = -sum [da e + a (da^T X + dc)], e = a^T X + c."""
+        c, Rv, tv = unpack(x)
+        f, N = c["f"], len(obs)
+        ctr = np.array([c["cx"], c["cy"]])
+        xn = [np.where(has[:, v, None], (np.nan_to_num(obs[:, v]) - ctr) / f, 0.0) for v in range(V)]
+        A = [[(xn[v][:, k:k + 1] * Rv[v][2] - Rv[v][k]) * has[:, v, None] for k in (0, 1)] for v in range(V)]
+        C = [[(xn[v][:, k] * tv[v][2] - tv[v][k]) * has[:, v] for k in (0, 1)] for v in range(V)]
+        M = sum(a[:, :, None] * a[:, None, :] for Av in A for a in Av)
+        b = -sum(a * cc[:, None] for Av, Cv in zip(A, C) for a, cc in zip(Av, Cv))
+        M += (1e-12 * np.trace(M, axis1=1, axis2=2) + 1e-300)[:, None, None] * np.eye(3)
+        Minv = np.linalg.inv(M)
+        X = (Minv @ b[..., None])[..., 0]
+        E = [[(a * X).sum(1) + cc for a, cc in zip(Av, Cv)] for Av, Cv in zip(A, C)]
+        Xc = [X @ Rv[v].T + tv[v] for v in range(V)]
+        z = [q[:, 2:3] for q in Xc]
+        xh = [q[:, :2] / zz for q, zz in zip(Xc, z)]
+        live = [(has[:, v] & (z[v][:, 0] > 0))[:, None] for v in range(V)]
+
+        def dX_of(terms):  # terms: (v, k, da, dc) with da (N,3) or None, dc (N,) or None
+            s = np.zeros((N, 3))
+            for v, k, da, dc in terms:
+                a = A[v][k]
+                inner = np.zeros(N)
+                if da is not None:
+                    da = da * has[:, v, None]
+                    s += da * E[v][k][:, None]
+                    inner += (da * X).sum(1)
+                if dc is not None:
+                    inner += dc * has[:, v]
+                s += a * inner[:, None]
+            return -(Minv @ s[..., None])[..., 0]
+
+        def column(dX, view=None, dR=None, dt=None, df=0.0):
+            out = []
+            for v in range(V):
+                dXc = dX @ Rv[v].T
+                if v == view:
+                    if dR is not None:
+                        dXc = dXc + X @ dR.T
+                    if dt is not None:
+                        dXc = dXc + dt
+                du = f * (dXc[:, :2] - xh[v] * dXc[:, 2:3]) / z[v] + df * xh[v]
+                out.append(np.where(live[v], du, 0.0).ravel())
+            return np.concatenate(out)
+
+        cols = []
+        if refine_f:
+            s_f = cam["f"] / f  # d xn / d phi = -xn * s_f
+            terms = [(v, k, -s_f * xn[v][:, k:k + 1] * Rv[v][2], -s_f * xn[v][:, k] * tv[v][2])
+                     for v in range(V) for k in (0, 1)]
+            cols.append(np.r_[column(dX_of(terms), df=cam["f"]), 0.0])
+        for j in range(1, V):
+            o = n_in + 6 * (j - 1)
+            dRs = cv2.Rodrigues(x[o:o + 3])[1].reshape(3, 3, 3)  # d R / d r_i
+            for i in range(3):
+                dR = dRs[i]
+                terms = [(j, k, xn[j][:, k:k + 1] * dR[2] - dR[k], None) for k in (0, 1)]
+                cols.append(np.r_[column(dX_of(terms), view=j, dR=dR), 0.0])
+            for i in range(3):
+                dt = np.eye(3)[i]
+                terms = [(j, k, None, xn[j][:, k] * dt[2] - dt[k]) for k in (0, 1)]
+                last = 1e3 * tv[1][i] / np.linalg.norm(tv[1]) / t1n if j == 1 else 0.0
+                cols.append(np.r_[column(dX_of(terms), view=j, dt=dt), last])
+        return np.stack(cols, 1)
+
+    exact = n_dist == 0 and cam["k1"] == 0 and cam["k2"] == 0
     x0 = [0.0] * int(refine_f) + [cam["k1"], cam["k2"]][:n_dist]
     for j in range(1, V):
         x0 += list(cv2.Rodrigues(Rs[j])[0].ravel()) + list(ts[j])
     x0 = np.array(x0, float)
     xs = np.r_[[0.01] * n_in, np.tile([0.01, 0.01, 0.01, 0.01 * t1n, 0.01 * t1n, 0.01 * t1n], V - 1)]
-    res = least_squares(resid, x0, loss="huber", f_scale=1.0, x_scale=xs, diff_step=1e-7,
-                        method="trf", max_nfev=max_nfev)
+    res = least_squares(resid, x0, jac=jac if exact else "2-point", loss="huber", f_scale=1.0, x_scale=xs,
+                        diff_step=1e-7, method="trf", max_nfev=max_nfev)
+    if os.environ.get("BA_JAC_CHECK") and exact:
+        from scipy.optimize._numdiff import approx_derivative
+        Jn = approx_derivative(resid, res.x, method="3-point", rel_step=1e-6)
+        Ja = jac(res.x)
+        log(f"    BA jac check: max |diff| {np.abs(Ja - Jn).max():.2e}, max |J| {np.abs(Jn).max():.2e}")
     if os.environ.get("BA_DEBUG"):
         r0 = resid(x0)[:-1]
         log(f"    BA: status {res.status} nfev {res.nfev}, rms {np.sqrt(np.mean(r0[r0 != 0]**2)):.3f} -> "
@@ -855,26 +929,37 @@ def flatten_grid(gu, gv, Z, support=None):
         d = np.linalg.norm(q[E[:, 0]] - q[E[:, 1]], axis=1)
         return np.concatenate([we * (d - L), anchor * (x - x0)])
 
-    m = len(E)
-    n2 = len(x0)
-    rows = np.r_[np.repeat(np.arange(m), 4), m + np.arange(n2)]
-    cols = np.r_[np.stack([2 * E[:, 0], 2 * E[:, 0] + 1, 2 * E[:, 1], 2 * E[:, 1] + 1], 1).ravel(), np.arange(n2)]
-    S = sparse.csr_matrix((np.ones(len(rows), int), (rows, cols)), shape=(m + n2, n2))
+    # Gauss-Newton with a direct sparse solve: the start (u, v) is close and the problem
+    # nearly linear, so it converges in ~4 steps (same result as trf/lsmr, half the time)
+    m, n2 = len(E), len(x0)
     rows_j = np.repeat(np.arange(m), 4)
     cols_j = np.stack([2 * E[:, 0], 2 * E[:, 0] + 1, 2 * E[:, 1], 2 * E[:, 1] + 1], 1).ravel()
-
-    def jac(x):
+    reg = sparse.identity(n2, format="csc") * anchor ** 2
+    x = x0.copy()
+    r = resid(x)
+    c = 0.5 * r @ r
+    for _ in range(30):
         q = x.reshape(-1, 2)
         dvec = q[E[:, 0]] - q[E[:, 1]]
-        d = np.linalg.norm(dvec, axis=1)
-        g = we[:, None] * dvec / np.maximum(d, 1e-12)[:, None]
-        vals = np.c_[g, -g].ravel()
-        Jd = sparse.csr_matrix((vals, (rows_j, cols_j)), shape=(m, n2))
-        return sparse.vstack([Jd, sparse.identity(n2, format="csr") * anchor], format="csr")
-
-    res = least_squares(resid, x0, jac=jac, method="trf", x_scale=1.0, max_nfev=200, tr_solver="lsmr")
-    st = res.x.reshape(nv_, nu_, 2)
-    strain = np.abs(resid(res.x)[:m]) / we / L
+        dist = np.linalg.norm(dvec, axis=1)
+        g = we[:, None] * dvec / np.maximum(dist, 1e-12)[:, None]
+        Jd = sparse.csr_matrix((np.c_[g, -g].ravel(), (rows_j, cols_j)), shape=(m, n2))
+        grad = Jd.T @ r[:m] + anchor * r[m:]
+        step = splu((Jd.T @ Jd).tocsc() + reg, permc_spec="MMD_AT_PLUS_A").solve(-grad)
+        a = 1.0
+        while True:
+            xn = x + a * step
+            rn = resid(xn)
+            cn = 0.5 * rn @ rn
+            if cn <= c or a < 1e-4:
+                break
+            a *= 0.5
+        done = c - cn <= 1e-10 * c
+        x, r, c = xn, rn, cn
+        if done:
+            break
+    st = x.reshape(nv_, nu_, 2)
+    strain = np.abs(r[:m]) / we / L
     return st, float(np.median(strain)), float(strain.max())
 
 
@@ -1174,6 +1259,26 @@ def asift_match(sims0, simsj, ratio=0.8):
     return P0[u], Pj[u]
 
 
+def essential(q0, qj, K, threshold, tries=4):
+    """Essential matrix (MAGSAC) that puts the most inliers in front of both cameras.
+    A single MAGSAC run occasionally returns a wrong model (e.g. forward motion, ~30 % of its
+    inliers behind a camera); a few seeded runs make this rare and reproducible."""
+    best = None
+    for k in range(tries):
+        cv2.setRNGSeed(k)
+        E, inl = cv2.findEssentialMat(q0, qj, K, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=threshold)
+        if E is None:
+            continue
+        E = E[:3]  # degenerate input can return several stacked solutions
+        inl = inl.ravel().astype(bool)
+        good = cv2.recoverPose(E, q0[inl], qj[inl], K)[0] if inl.sum() >= 5 else 0
+        if best is None or good > best[0]:
+            best = (good, E, inl)
+        if good >= 0.95 * inl.sum():
+            break
+    return (None, np.zeros(len(q0), bool)) if best is None else best[1:]
+
+
 def page_coverage(pts, mask, n=8):
     """Share of page cells (n x n over the page bbox) containing >= 3 points."""
     ys, xs = np.nonzero(mask)
@@ -1203,11 +1308,12 @@ def parallax_deg(q0, qj, R, cam):
 def sift_detect(g, mask, n_features, ny=4, nx=3, overlap=200):
     """SIFT on overlapping tiles, one after another. OpenCV's SIFT upsamples the image 2x
     internally (~2 GB for a 9 MP photo); per tile the memory is a fraction of that and the
-    keypoints are the same. Each keypoint is kept by the tile whose core contains it."""
+    keypoints are the same. Each keypoint is kept by the tile whose core contains it.
+    Returns keypoint positions (n, 2) and descriptors."""
     h, w = g.shape
     ys = np.linspace(0, h, ny + 1).astype(int)
     xs = np.linspace(0, w, nx + 1).astype(int)
-    kps, ds = [], []
+    pts, resp, ds = [], [], []
     sift = cv2.SIFT_create(contrastThreshold=0.02)
     for i in range(ny):
         for j in range(nx):
@@ -1219,21 +1325,22 @@ def sift_detect(g, mask, n_features, ny=4, nx=3, overlap=200):
             kp, d = sift.detectAndCompute(np.ascontiguousarray(g[Y0:Y1, X0:X1]), m)
             if d is None:
                 continue
-            for k, dk in zip(kp, d):
-                x, y = k.pt[0] + X0, k.pt[1] + Y0
-                if x0 <= x < x1 and y0 <= y < y1:
-                    kps.append(cv2.KeyPoint(x, y, k.size, k.angle, k.response, k.octave, k.class_id))
-                    ds.append(dk)
-    d = np.array(ds, np.float32).reshape(-1, 128)
-    if n_features and len(kps) > n_features:
-        order = np.argsort([-k.response for k in kps], kind="stable")[:n_features]
-        kps = [kps[i] for i in order]
-        d = d[order]
-    return kps, d
+            p = cv2.KeyPoint_convert(kp).astype(np.float64) + (X0, Y0)
+            own = (p[:, 0] >= x0) & (p[:, 0] < x1) & (p[:, 1] >= y0) & (p[:, 1] < y1)
+            pts.append(p[own].astype(np.float32))  # float32 like cv2.KeyPoint.pt
+            resp.append(np.float32([k.response for k in kp])[own])
+            ds.append(d[own])
+    if not pts:
+        return np.zeros((0, 2)), np.zeros((0, 128), np.float32)
+    pts, resp, d = np.concatenate(pts).astype(np.float64), np.concatenate(resp), np.concatenate(ds)
+    if n_features and len(pts) > n_features:
+        order = np.argsort(-resp, kind="stable")[:n_features]
+        pts, d = pts[order], d[order]
+    return pts, d
 
 
-def match_ref(kp0, d0, kp, d):
-    flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=64))
+def match_ref(d0, pts, d):
+    flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=4), dict(checks=32))  # 99 % of the matches of 5/64, half the time
     m01 = flann.knnMatch(d0, d, k=2)
     m10 = flann.knnMatch(d, d0, k=2)
     back = {m[0].queryIdx: m[0].trainIdx for m in m10 if len(m) == 2 and m[0].distance < 0.85 * m[1].distance}
@@ -1241,8 +1348,8 @@ def match_ref(kp0, d0, kp, d):
     for m in m01:
         if len(m) == 2 and m[0].distance < 0.85 * m[1].distance and back.get(m[0].trainIdx) == m[0].queryIdx:
             i0.append(m[0].queryIdx)
-            pj.append(kp[m[0].trainIdx].pt)
-    return np.array(i0, int), np.float64(pj), len(kp)
+            pj.append(m[0].trainIdx)
+    return np.array(i0, int), pts[np.array(pj, int)].reshape(-1, 2), len(pts)
 
 
 def densify_multi(g0, gs, mask, p_ref, X, cam, Rs, ts, max_pts, min_dist, search, threads=1):
@@ -1373,9 +1480,8 @@ def main():
     mask_er = cv2.erode(masks[0], np.ones((15, 15), np.uint8))
 
     log("matching ...")
-    kp0, d0 = sift_detect(gs[0], mask_er, args.features)
-    P0 = np.float64([k.pt for k in kp0])
-    obs = np.full((len(kp0), V, 2), np.nan)
+    P0, d0 = sift_detect(gs[0], mask_er, args.features)
+    obs = np.full((len(P0), V, 2), np.nan)
     obs[:, 0] = P0
     Ks = cam_K(cam)
     mjs = [None] + [cv2.dilate(masks[j], np.ones((41, 41), np.uint8)) if masks[j] is not None else None
@@ -1387,9 +1493,9 @@ def main():
     def match_view(j):
         mj = mjs[j]
         kpj, dj = feats_j[j]
-        i0, pj, nk = match_ref(kp0, d0, kpj, dj)
-        E, inl = cv2.findEssentialMat(P0[i0], pj, Ks, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=1.0)
-        inl = inl.ravel().astype(bool)
+        cv2.setRNGSeed(j)  # FLANN/MAGSAC randomness per view, independent of the thread count
+        i0, pj, nk = match_ref(d0, kpj, dj)
+        E, inl = essential(P0[i0], pj, Ks, 1.0)
         i0, pj = i0[inl], pj[inl]
         q0, qj = P0[i0], pj
         cov = page_coverage(q0, mask_er)
@@ -1406,13 +1512,11 @@ def main():
             a0, aj = asift_match(sims0[0], simsj)
             a0, aj = (a0 + 0.5) / sa - 0.5, (aj + 0.5) / sa - 0.5
             q0, qj = np.r_[q0, a0], np.r_[qj, aj]
-            E, inl = cv2.findEssentialMat(q0, qj, Ks, method=cv2.USAC_MAGSAC, prob=0.99999, threshold=1.5)
-            inl = inl.ravel().astype(bool)
+            E, inl = essential(q0, qj, Ks, 1.5)
             q0, qj = q0[inl], qj[inl]
             used_asift = True
         if E is None or len(q0) < 8:
             sys.exit(f"view {j}: no usable matches with the reference view")
-        E = E[:3]  # degenerate input can return several stacked solutions
         _, R, t, _ = cv2.recoverPose(E, q0, qj, Ks)
         par = parallax_deg(q0, qj, R, cam)
         if par < 1.5:
