@@ -324,13 +324,14 @@ void match_ref(const cv::Mat& d0, cv::flann::Index* index0, const Pts2& pts, con
                std::vector<int>& i0, Pts2& pj) {
     std::vector<int> b01, b10;
     std::vector<char> g01, g10;
-    Thread t([&] {
+    cv::Ptr<cv::flann::Index> index;
+    Thread t([&] {  // single-threaded tree construction, alongside the first search
         cv::setRNGSeed(seed);  // FLANN tree construction is random
-        auto index = flann_index(d);
-        knn_ratio(d0, index.get(), b01, g01);
+        index = flann_index(d);
     });
     knn_ratio(d, index0, b10, g10);
     t.join();
+    knn_ratio(d0, index.get(), b01, g01);
     i0.clear();
     pj.clear();
     for (int i = 0; i < d0.rows; i++)

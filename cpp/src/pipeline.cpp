@@ -196,6 +196,20 @@ struct Session::Impl {
     }
 
     cv::Mat solve(const std::vector<int>& vidx) const;  // indices into views
+    // state handed from the 3D part to edge/line correction and rendering
+    struct Flat {
+        Surface S;
+        Frame F;
+        Cam cam;
+        Pts2 st, sto, out0, ctarget;
+        std::vector<char> hit, use;
+        std::vector<int> side;
+        std::vector<size_t> cidx;
+        Pts3 uvz;  // measured surface points (page frame)
+        std::vector<double> rres;
+    };
+    cv::Mat solve_single() const;  // one photo: page plane from its corners
+    cv::Mat correct_render(Flat& fl) const;
 };
 
 Session::Session(int width, int height, const Options& opt) : p(std::make_unique<Impl>()) {
@@ -247,11 +261,11 @@ cv::Mat Session::finish() {
     std::vector<int> use;
     for (int j = 0; j < size(); j++) use.push_back(j);
     while (true) {
-        if (use.size() < 2) fail("need at least two usable photos");
+        if (use.empty()) fail("no usable photo");
         try {
             return p->solve(use);
         } catch (const BadViews& b) {
-            if ((int)use.size() - (int)b.views.size() < 2) fail(b.first_error);
+            if ((int)use.size() - (int)b.views.size() < 1) fail(b.first_error);
             std::vector<int> keep;
             std::string dropped;
             for (size_t k = 0; k < use.size(); k++) {
@@ -265,7 +279,7 @@ cv::Mat Session::finish() {
 }
 
 cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
-    if (images.size() < 2) fail("need at least two images");
+    if (images.empty()) fail("no images");
     if (images.size() > 8) fail("at most 8 images");
     Session S(images[0].cols, images[0].rows, opt);
     log(fmt("%zu views, focal start %.1f px", images.size(), S.p->f_full));
@@ -297,13 +311,14 @@ cv::Mat process(const std::vector<cv::Mat>& images, const Options& opt) {
         log(vd[j].m.msg);
         S.p->views.push_back(std::move(vd[j]));
     }
-    if (S.size() < 2) fail(first_error);
+    if (S.size() < 1) fail(first_error);
     return S.finish();
 }
 
 // ---------------------------------------------------------------- 3D, unrolling, rendering
 
 cv::Mat Session::Impl::solve(const std::vector<int>& vidx) const {
+    if (vidx.size() == 1) return solve_single();
     const int V = (int)vidx.size();
     const double W = opt.page_w, H = opt.page_h;
     const double grid = opt.grid > 0 ? opt.grid : (V >= 3 ? 2.5 : 4.0);
@@ -606,6 +621,25 @@ cv::Mat Session::Impl::solve(const std::vector<int>& vidx) const {
     for (auto& p : st) p = rect_apply(rect, p);
     for (auto& p : sto) p = rect_apply(rect, p);
 
+    Flat fl{std::move(S), F, cam, std::move(st), std::move(sto), std::move(out0), ctarget, std::move(hit),
+            std::move(use), std::move(side), cidx, std::move(uvz), std::move(rres)};
+    return correct_render(fl);
+}
+
+cv::Mat Session::Impl::correct_render(Flat& fl) const {
+    const double W = opt.page_w, H = opt.page_h;
+    const Surface& S = fl.S;
+    const Frame& F = fl.F;
+    const Cam& cam = fl.cam;
+    Pts2 &st = fl.st, &sto = fl.sto;
+    const Pts2 &out0 = fl.out0, &ctarget = fl.ctarget;
+    const std::vector<char>& hit = fl.hit;
+    const std::vector<char>& use = fl.use;
+    const std::vector<int>& side = fl.side;
+    const std::vector<size_t>& cidx = fl.cidx;
+    const Pts3& uvz = fl.uvz;
+    const std::vector<double>& rres = fl.rres;
+
     // ---------------------------------------------------------------- edge and line correction
     const Cam camf{cam.f / s, (cam.cx + 0.5) / s - 0.5, (cam.cy + 0.5) / s - 0.5};
     std::vector<EdgeTerm> edges;
@@ -722,7 +756,7 @@ cv::Mat Session::Impl::solve(const std::vector<int>& vidx) const {
             p += de(p);
             dd.push_back(de(p).norm());
         }
-        log(fmt("  edge correction: shift at measured content median %.3f mm", median(dd)));
+        if (!dd.empty()) log(fmt("  edge correction: shift at measured content median %.3f mm", median(dd)));
     }
     // 2) lines: printed lines may override the measurement (weak hold); the corrected
     //    outline stays where it is
@@ -790,6 +824,94 @@ cv::Mat Session::Impl::solve(const std::vector<int>& vidx) const {
     cv::Mat out = clean_paper(to_uint8(alb));
     log(fmt("  warp %.2f s, shading %.2f s, paper %.2f s", t_render, t_shading, secs(t)));
     return out;
+}
+
+// One photo: no 3D measurement. The page is taken as the plane through its four corners (known
+// focal), the curved outline and printed lines then straighten what the folds bend.
+cv::Mat Session::Impl::solve_single() const {
+    const double W = opt.page_w, H = opt.page_h;
+    const double step = opt.grid > 0 ? opt.grid : 4.0;
+    log("1 photo: page plane from its corners ...");
+    Flat fl;
+    fl.cam = cam;
+    double horiz = ((quad[1] - quad[0]).norm() + (quad[2] - quad[3]).norm()) / 2;
+    double vert = ((quad[3] - quad[0]).norm() + (quad[2] - quad[1]).norm()) / 2;
+    double pw = horiz <= vert ? W : H, ph = horiz <= vert ? H : W;
+    std::vector<cv::Point2f> src{{0, 0}, {(float)pw, 0}, {(float)pw, (float)ph}, {0, (float)ph}}, dst;
+    for (auto& q : quad) dst.emplace_back((float)q.x(), (float)q.y());
+    cv::Mat Hc = cv::getPerspectiveTransform(src, dst);
+    Eigen::Matrix3d Hm, K;
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++) Hm(r, k) = Hc.at<double>(r, k);
+    K << cam.f, 0, cam.cx, 0, cam.f, cam.cy, 0, 0, 1;
+    Eigen::Matrix3d M = K.inverse() * Hm;
+    Vec3 h1 = M.col(0), h2 = M.col(1);
+    Vec3 n = h1.cross(h2).normalized();
+    Vec3 c = M.col(2) * (2 / (h1.norm() + h2.norm()));
+    if (c.z() < 0) c = -c;
+    log(fmt("  page tilt %.1f deg", std::acos(std::min(1.0, std::abs(n.z()))) * 180 / M_PI));
+    fl.F = page_frame(cam, quad, c, n, W, H);
+    const Frame& F = fl.F;
+
+    {
+        Pts2 o;
+        std::vector<char> ok;
+        page_outline(views[0].gray, views[0].mask, o, ok);
+        for (size_t i = 0; i < o.size(); i++)
+            if (ok[i]) fl.out0.push_back(o[i]);
+    }
+    const Pts2& out0 = fl.out0;
+    if (out0.size() < 50) fail("could not trace the page outline");
+    for (int e : assign_edges(out0, quad)) fl.side.push_back(e >= 0 ? F.edge_map[e] : -1);
+
+    // flat surface over the page and its outline
+    Pts2 uv;
+    for (auto& p : out0) {
+        Vec3 r = Vec3((p.x() - cam.cx) / cam.f, (p.y() - cam.cy) / cam.f, 1.0);
+        Vec3 u = F.to_page(r * (c.dot(n) / r.dot(n)));
+        uv.push_back(u.head<2>());
+    }
+    auto bnd = grid_bounds(uv, W, H);
+    Surface& S = fl.S;
+    S.g.u0 = bnd[0], S.g.v0 = bnd[2], S.g.step = step;
+    S.g.nu = (int)std::ceil((bnd[1] + step - bnd[0]) / step);
+    S.g.nv = (int)std::ceil((bnd[3] + step - bnd[2]) / step);
+    S.Z.assign((size_t)S.g.nu * S.g.nv, 0.0);
+    fl.st.resize(S.Z.size());
+    for (int j = 0; j < S.g.nv; j++)
+        for (int i = 0; i < S.g.nu; i++) fl.st[(size_t)j * S.g.nu + i] = Vec2(S.g.gu(i), S.g.gv(j));
+
+    Pts3 Xo;
+    ray_surface(out0, cam, F, S, c, n, Xo, fl.hit);
+    fl.sto.resize(out0.size());
+    for (size_t i = 0; i < out0.size(); i++) {
+        Vec3 u = F.to_page(Xo[i]);
+        fl.sto[i] = sample_st(fl.st, S.g, u.x(), u.y());
+    }
+    fl.cidx.resize(4);
+    fl.ctarget.resize(4);
+    for (int k = 0; k < 4; k++) {
+        size_t b = 0;
+        for (size_t i = 1; i < out0.size(); i++)
+            if ((out0[i] - quad[k]).norm() < (out0[b] - quad[k]).norm()) b = i;
+        fl.cidx[k] = b;
+        int sa = F.edge_map[(k + 3) % 4], sb = F.edge_map[k];
+        bool top = sa == 0 || sb == 0, left = sa == 3 || sb == 3;
+        fl.ctarget[k] = Vec2(left ? 0.0 : W, top ? 0.0 : H);
+    }
+    fl.use.assign(out0.size(), 0);
+    Pts2 su;
+    std::vector<int> sd;
+    for (size_t i = 0; i < out0.size(); i++)
+        if ((fl.use[i] = fl.hit[i] && fl.side[i] >= 0)) su.push_back(fl.sto[i]), sd.push_back(fl.side[i]);
+    Eigen::Vector4d rect = fit_rectangle(su, sd, W, H, corners_init(select(fl.sto, fl.cidx), fl.ctarget), fl.rres);
+    double rms = 0;
+    for (double r : fl.rres) rms += r * r;
+    log(fmt("  outline fit: scale %.4f, rms %.3f mm (%zu outline points)", rect[0], std::sqrt(rms / fl.rres.size()),
+            su.size()));
+    for (auto& p : fl.st) p = rect_apply(rect, p);
+    for (auto& p : fl.sto) p = rect_apply(rect, p);
+    return correct_render(fl);
 }
 
 }  // namespace docscan

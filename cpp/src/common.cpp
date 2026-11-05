@@ -8,6 +8,8 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <condition_variable>
+#include <deque>
 #include <exception>
 #include <thread>
 
@@ -268,40 +270,109 @@ Thread::~Thread() {
     delete p;
 }
 
-static thread_local bool in_parallel = false;
+// Persistent workers (created once, 16 MB stacks). A parallel_for posts a job; idle workers and
+// the caller take chunks from it until none are left.
+namespace {
+thread_local bool in_parallel = false;
+
+struct Job {
+    const std::function<void(const cv::Range&)>* fn;
+    int start, n, chunk, chunks;
+    std::atomic<int> next{0}, done{0};
+    std::exception_ptr err;
+    std::mutex m;
+    std::condition_variable cv;
+    // runs chunks until none are left; false if there was nothing to take
+    bool help() {
+        bool any = false;
+        for (int c; (c = next.fetch_add(1)) < chunks;) {
+            any = true;
+            int a = c * chunk;
+            try {
+                if (!err) (*fn)(cv::Range(start + a, start + std::min(n, a + chunk)));
+            } catch (...) {
+                std::lock_guard<std::mutex> l(m);
+                if (!err) err = std::current_exception();
+            }
+            if (done.fetch_add(1) + 1 == chunks) {
+                std::lock_guard<std::mutex> l(m);
+                cv.notify_all();
+            }
+        }
+        return any;
+    }
+};
+
+class Pool {
+public:
+    static Pool& get() {
+        static Pool* p = new Pool();  // never destroyed: workers live as long as the process
+        return *p;
+    }
+    int size() const { return (int)workers.size() + 1; }
+    void post(const std::shared_ptr<Job>& j) {
+        {
+            std::lock_guard<std::mutex> l(m);
+            jobs.push_back(j);
+        }
+        cv.notify_all();
+    }
+
+private:
+    Pool() {
+        int n = std::max(cv::getNumThreads(), 1) - 1;
+        for (int i = 0; i < n; i++) workers.push_back(std::make_unique<Thread>([this] { loop(); }));
+    }
+    void loop() {
+        in_parallel = true;
+        for (;;) {
+            std::shared_ptr<Job> j;
+            {
+                std::unique_lock<std::mutex> l(m);
+                cv.wait(l, [&] { return !jobs.empty(); });
+                j = jobs.front();
+                if (j->next.load() >= j->chunks) {  // fully handed out
+                    jobs.pop_front();
+                    continue;
+                }
+            }
+            j->help();
+        }
+    }
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<std::shared_ptr<Job>> jobs;
+    std::vector<std::unique_ptr<Thread>> workers;
+};
+}  // namespace
 
 void parallel_for(const cv::Range& r, const std::function<void(const cv::Range&)>& fn) {
     const int n = r.size();
     if (n <= 0) return;
-    const int threads = std::min(std::max(cv::getNumThreads(), 1), n);
-    if (threads == 1 || in_parallel) {
+    if (in_parallel || n == 1) {
         fn(r);
         return;
     }
-    const int chunk = std::max(1, n / (threads * 8));
-    std::atomic<int> next{0};
-    auto work = [&] {
-        bool outer = in_parallel;
-        in_parallel = true;
-        for (int a; (a = next.fetch_add(chunk)) < n;) fn(cv::Range(r.start + a, r.start + std::min(n, a + chunk)));
-        in_parallel = outer;
-    };
-    std::vector<std::unique_ptr<Thread>> th;
-    for (int i = 1; i < threads; i++) th.push_back(std::make_unique<Thread>(work));
-    std::exception_ptr err;
-    try {
-        work();
-    } catch (...) {
-        err = std::current_exception();
-        next = n;  // stop handing out chunks
+    Pool& pool = Pool::get();
+    if (pool.size() == 1) {
+        fn(r);
+        return;
     }
-    for (auto& t : th) try {
-            t->join();
-        } catch (...) {
-            if (!err) err = std::current_exception();
-            next = n;
-        }
-    if (err) std::rethrow_exception(err);
+    auto j = std::make_shared<Job>();
+    j->fn = &fn;
+    j->start = r.start;
+    j->n = n;
+    j->chunk = std::max(1, n / (pool.size() * 8));
+    j->chunks = (n + j->chunk - 1) / j->chunk;
+    pool.post(j);
+    in_parallel = true;
+    j->help();
+    in_parallel = false;
+    {
+        std::unique_lock<std::mutex> l(j->m);
+        j->cv.wait(l, [&] { return j->done.load() == j->chunks; });
+    }
+    if (j->err) std::rethrow_exception(j->err);
 }
 
 }  // namespace docscan
