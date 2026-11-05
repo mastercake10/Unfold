@@ -193,6 +193,11 @@ struct Session::Impl {
         refine_subpixel(views[0].gray, v.gray, q0, qj, A, r.pr, r.ok, 15, 4);
         int nok = 0;
         for (size_t k = 0; k < q0.size(); k++) nok += r.ok[k] = r.ok[k] && (r.pr[k] - qj[k]).norm() < 1.5;
+        if (nok < 100) {  // the 3D part needs many more; good photos give 1000+
+            r.error = fmt("photo %d: too little in common with photo 1 (%d points). Keep the whole page in view "
+                          "and move the phone 10-20 cm.", j + 1, nok);
+            return v;
+        }
         r.msg = fmt("  photo %d: %zu keypoints, %zu inliers, %d refined, page coverage %.2f%s\n"
                     "    page %.2f s, features %.2f s, matching %.2f s, pose %.2f s, refinement %.2f s",
                     j + 1, kps.size(), q0.size(), nok, cov,
@@ -270,7 +275,16 @@ cv::Mat Session::finish() {
     while (true) {
         if (use.empty()) fail("no usable photo");
         try {
-            return p->solve(use);
+            try {
+                return p->solve(use);
+            } catch (const BadViews&) {
+                throw;
+            } catch (const std::exception& e) {
+                if (use.size() == 1) throw;
+                // the extra photos are optional: without a usable 3D part, photo 1 alone
+                log(std::string("3D failed (") + e.what() + "), leaving out the other photos");
+                return p->solve({use[0]});
+            }
         } catch (const BadViews& b) {
             if ((int)use.size() - (int)b.views.size() < 1) fail(b.first_error);
             std::vector<int> keep;
