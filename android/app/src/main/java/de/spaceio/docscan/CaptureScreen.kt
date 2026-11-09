@@ -19,8 +19,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
@@ -39,6 +37,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -69,31 +68,33 @@ fun CaptureScreen(model: ScanModel) {
     var quad by remember { mutableStateOf<FloatArray?>(null) }
     var busy by remember { mutableStateOf(false) }
     var settings by remember { mutableStateOf(false) }
+    var flashUnit by remember { mutableStateOf(false) }
     if (settings) SettingsDialog(model) { settings = false }
     val previewView = remember {
         PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
     }
     DisposableEffect(owner) {
         rig.onQuad = { q -> previewView.post { quad = q } }
+        rig.onFlashAvailable = { a -> previewView.post { flashUnit = a } }
         rig.bind(owner, previewView)
         onDispose { rig.release() }
     }
 
     val n = model.shots.size
-    // first photo gone (retaken or rejected): measure focus again for the next one
+    // first photo gone (rejected): measure focus again for the next one
     LaunchedEffect(n == 0) { if (n == 0) rig.unlockFocus() }
-    val step = n.coerceAtMost(STEPS.size - 1)
+    LaunchedEffect(model.flashOn) { rig.setFlashMode(model.flashOn) }
     val q = quad
     val ok = q != null && pageOk(q)
 
     Column(Modifier.fillMaxSize().background(Color.Black)) {
         Column(Modifier.padding(16.dp).height(96.dp)) {
             Text(
-                "${step + 1} / ${STEPS.size} · ${STEPS[step].first}",
+                "Page",
                 color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
             )
             Spacer(Modifier.height(4.dp))
-            Text(STEPS[step].second, color = Color(0xFFDDDDDD), fontSize = 15.sp)
+            Text(CAPTURE_HINT, color = Color(0xFFDDDDDD), fontSize = 15.sp)
         }
         Box(Modifier.fillMaxWidth().aspectRatio(3f / 4f)) {
             AndroidView({ previewView }, Modifier.fillMaxSize())
@@ -125,13 +126,13 @@ fun CaptureScreen(model: ScanModel) {
             ) {
                 Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Color.White)
             }
-        }
-        Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-            STEPS.forEachIndexed { i, (name, _) ->
-                Text(
-                    (if (i < n) "✓ " else "") + name,
-                    color = if (i < n) Ok else if (i == n) Color.White else Color.Gray, fontSize = 14.sp,
-                )
+            if (flashUnit) {
+                IconButton(
+                    onClick = { model.changeFlash(!model.flashOn) }, enabled = !busy,
+                    modifier = Modifier.align(Alignment.TopStart).padding(8.dp).background(Color(0x99000000), CircleShape),
+                ) {
+                    FlashIcon(model.flashOn)
+                }
             }
         }
         model.notice?.let {
@@ -154,19 +155,17 @@ fun CaptureScreen(model: ScanModel) {
         Spacer(Modifier.weight(1f))
         Row(
             Modifier.fillMaxWidth().padding(bottom = 24.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically,
         ) {
-            OutlinedButton(onClick = { model.undo() }, enabled = n > 0 && !busy) { Text("Retake") }
             Box(
                 Modifier.size(76.dp).clip(CircleShape)
-                    .clickable(enabled = !busy && n < STEPS.size) {
+                    .clickable(enabled = !busy && n == 0) {
                         busy = true
                         val file = model.nextShotFile()
                         rig.shoot(file, lockAfter = n == 0) { r ->
                             busy = false
                             r.onSuccess { sz ->
-                                model.addShot(file, if (n == 0) rig.focalPx(sz.width, sz.height) else null)
-                                if (model.shots.size == STEPS.size) model.process()
+                                model.addShot(file, rig.focalPx(sz.width, sz.height))
                             }.onFailure {
                                 Toast.makeText(context, "Photo failed: ${it.message}", Toast.LENGTH_LONG).show()
                             }
@@ -174,9 +173,33 @@ fun CaptureScreen(model: ScanModel) {
                     }
                     // the whole button reacts, including the outer ring
                     .border(4.dp, Color.White, CircleShape).padding(8.dp)
-                    .clip(CircleShape).background(if (busy || n >= STEPS.size) Color.Gray else Color.White)
+                    .clip(CircleShape).background(if (busy || n > 0) Color.Gray else Color.White)
             )
-            Button(onClick = { model.process() }, enabled = n >= 1 && !busy) { Text("Process") }
+        }
+    }
+}
+
+/** Lightning bolt: yellow when the flash is on, grey with a red slash when off. */
+@Composable
+private fun FlashIcon(on: Boolean) {
+    Canvas(Modifier.size(22.dp)) {
+        val p = Path().apply {
+            moveTo(size.width * 0.58f, 0f)
+            lineTo(size.width * 0.10f, size.height * 0.58f)
+            lineTo(size.width * 0.45f, size.height * 0.58f)
+            lineTo(size.width * 0.36f, size.height)
+            lineTo(size.width * 0.90f, size.height * 0.40f)
+            lineTo(size.width * 0.52f, size.height * 0.40f)
+            close()
+        }
+        drawPath(p, if (on) Color(0xFFFFD54A) else Color(0xFF999999))
+        if (!on) {
+            drawLine(
+                Color(0xFFFF5252),
+                Offset(size.width * 0.06f, size.height * 0.06f),
+                Offset(size.width * 0.94f, size.height * 0.94f),
+                strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round,
+            )
         }
     }
 }

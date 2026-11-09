@@ -51,6 +51,11 @@ class CameraRig(private val context: Context) {
     var focusLocked = false
         private set
 
+    private var flashOn = false
+
+    /** Called on the main thread after bind() with whether the camera has a flash unit. */
+    var onFlashAvailable: (Boolean) -> Unit = {}
+
     /** Called on the analysis thread with the page corners (normalised, upright) or null. */
     var onQuad: (FloatArray?) -> Unit = {}
 
@@ -78,7 +83,7 @@ class CameraRig(private val context: Context) {
             val cap = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                 .setJpegQuality(95)
-                .setFlashMode(ImageCapture.FLASH_MODE_OFF)
+                .setFlashMode(if (flashOn) ImageCapture.FLASH_MODE_ON else ImageCapture.FLASH_MODE_OFF)
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
                         .setAspectRatioStrategy(ratio43)
@@ -122,7 +127,17 @@ class CameraRig(private val context: Context) {
             if (focusLocked) applyFocusLock(cam)
             camera = cam
             capture = cap
+            val hasFlash = Camera2CameraInfo.from(cam.cameraInfo)
+                .getCameraCharacteristic(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
+            if (!hasFlash) cap.setFlashMode(ImageCapture.FLASH_MODE_OFF)
+            onFlashAvailable(hasFlash)
         }, ContextCompat.getMainExecutor(context))
+    }
+
+    /** Flash for the next photos; may be called before bind(). */
+    fun setFlashMode(on: Boolean) {
+        flashOn = on
+        capture?.setFlashMode(if (on) ImageCapture.FLASH_MODE_ON else ImageCapture.FLASH_MODE_OFF)
     }
 
     /** Focal length in pixels for an image of the given size, from the camera characteristics. */

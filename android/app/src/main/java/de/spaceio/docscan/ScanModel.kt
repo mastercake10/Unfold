@@ -19,12 +19,9 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 
-/** The guided shots, in pipeline order: the first one is rendered, the second is optional. */
-val STEPS = listOf(
-    "Page" to "Hold the phone above the page, page large and centred, and take the photo.",
-    "Extra" to "Optional, for folded pages: move the phone 10–20 cm to the right at the same height and " +
-        "take a second photo. Or press Process.",
-)
+/** What to tell the user while the single photo is taken. */
+const val CAPTURE_HINT =
+    "Hold the phone above the page, page large and centred, and take the photo."
 
 sealed interface Phase {
     data object Capture : Phase
@@ -34,9 +31,9 @@ sealed interface Phase {
 }
 
 /**
- * Each photo is analysed natively right after it is taken (features, matching with photo 1), so
- * after the last photo only the 3D and rendering part is left. All native calls run in order on
- * one worker thread.
+ * The single photo is analysed natively right after it is taken (page outline, features), and the
+ * 3D part is computed as soon as the photo is accepted. All native calls run in order on one
+ * worker thread.
  */
 class ScanModel(app: Application) : AndroidViewModel(app) {
     private val shotDir = File(app.cacheDir, "shots").apply { mkdirs() }
@@ -46,8 +43,8 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
     // the pipeline needs more stack than a default thread has
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(null, r, "docscan", 64L shl 20) }
     private val accepted = ArrayList<File>()  // photos the native session holds; worker thread only
-    // Result for photo 1 alone, made right after it is accepted (most scans have one photo), so
-    // "Process" can show it at once. Worker thread only; valid while photo 1 is the only photo.
+    // Result for the photo, made as soon as it is accepted, so the result screen appears without
+    // another render pass. Worker thread only.
     private var early: File? = null
     private var earlyErr: String? = null
     private var earlyFor: File? = null
@@ -68,6 +65,15 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
     /** Clean look: ink to black, light grey to white (better OCR on most letters, fades light grey print). */
     var docTone by mutableStateOf(prefs.getBoolean("docTone", true))
         private set
+
+    /** Flash on the photo (remembered). */
+    var flashOn by mutableStateOf(prefs.getBoolean("flashOn", false))
+        private set
+
+    fun changeFlash(on: Boolean) {
+        flashOn = on
+        prefs.edit().putBoolean("flashOn", on).apply()
+    }
 
     fun changeDocTone(on: Boolean) {
         docTone = on
@@ -106,22 +112,11 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
                     shots.remove(f)
                     f.delete()
                     notice = "$err\nPlease take this photo again."
+                } else {
+                    process()  // one photo is the whole scan
                 }
             }
             if (err == null && accepted.size == 1) makeEarly(f, docTone)
-        }
-    }
-
-    fun undo() {
-        val f = shots.removeLastOrNull() ?: return
-        notice = null
-        worker.execute {
-            if (accepted.lastOrNull() == f) {
-                accepted.removeAt(accepted.size - 1)
-                Native.removeLast()
-            }
-            if (accepted.size != 1 || accepted[0] != earlyFor) early = null
-            f.delete()
         }
     }
 
