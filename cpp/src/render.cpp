@@ -448,38 +448,45 @@ cv::Mat clean_paper(const cv::Mat& img, bool gpu, bool doc_tone) {
     return out;
 }
 
-// Text lines of an upright grey page at about 6 px/mm: ink per row of each line, summed as
-// ascender minus descender ink (positive for upright Latin text); n: lines found.
+// Text lines of an upright grey page at about 6 px/mm: ink per row, summed as ascender minus
+// descender ink (positive for upright Latin text); n: lines found. Measured on short horizontal
+// chunks (~8 mm) so a bent or slightly tilted line does not smear the profile.
 static void line_profile(const cv::Mat& g, double ppm, int& n, double& score) {
     const int px = std::max(1, (int)std::lround(ppm));
+    const int chunk = 8 * px;  // ~8 mm
     cv::Mat ink, blob, lab, stats, cent;
     cv::adaptiveThreshold(g, ink, 255, cv::ADAPTIVE_THRESH_MEAN_C, cv::THRESH_BINARY_INV, 15 * px | 1, 12);
     cv::morphologyEx(ink, blob, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(4 * px, 1)));
     int nc = cv::connectedComponentsWithStats(blob, lab, stats, cent, 8, CV_32S);
     n = 0;
-    double up = 0, down = 0;
+    double up = 0, down = 0, wsum = 0;
     for (int k = 1; k < nc; k++) {
         int x0 = stats.at<int>(k, cv::CC_STAT_LEFT), y0 = stats.at<int>(k, cv::CC_STAT_TOP);
         int w = stats.at<int>(k, cv::CC_STAT_WIDTH), h = stats.at<int>(k, cv::CC_STAT_HEIGHT);
         if (w < 25 * ppm || h > 7 * ppm || h < 1.5 * ppm || w < 6 * h) continue;
-        std::vector<int> prof(h, 0);
-        for (int y = 0; y < h; y++) {
-            const int* l = lab.ptr<int>(y0 + y);
-            const uchar* q = ink.ptr<uchar>(y0 + y);
-            for (int x = x0; x < x0 + w; x++) prof[y] += l[x] == k && q[x];
-        }
-        int mx = *std::max_element(prof.begin(), prof.end());
-        int top = 0, bot = h - 1;
-        while (top < h && prof[top] < mx / 2) top++;
-        while (bot > 0 && prof[bot] < mx / 2) bot--;
-        if (bot - top < 2) continue;  // a ruled line, not text
-        double a = 0, b = 0, c = 0;
-        for (int y = 0; y < h; y++) (y < top ? a : y > bot ? b : c) += prof[y];
-        if (c <= 0) continue;
-        up += a / c, down += b / c;
         n++;
+        for (int xa = x0; xa < x0 + w; xa += chunk) {
+            int xb = std::min(x0 + w, xa + chunk);
+            if (xb - xa < chunk / 2) continue;
+            std::vector<int> prof(h, 0);
+            for (int y = 0; y < h; y++) {
+                const int* l = lab.ptr<int>(y0 + y);
+                const uchar* q = ink.ptr<uchar>(y0 + y);
+                for (int x = xa; x < xb; x++) prof[y] += l[x] == k && q[x];
+            }
+            int mx = *std::max_element(prof.begin(), prof.end());
+            int top = 0, bot = h - 1;
+            while (top < h && prof[top] < mx / 2) top++;
+            while (bot > 0 && prof[bot] < mx / 2) bot--;
+            if (bot - top < 2) continue;  // a ruled line, not text
+            double a = 0, b = 0, c = 0;
+            for (int y = 0; y < h; y++) (y < top ? a : y > bot ? b : c) += prof[y];
+            if (c <= 0) continue;
+            double wgt = xb - xa;
+            up += a / c * wgt, down += b / c * wgt, wsum += wgt;
+        }
     }
-    score = n ? (up - down) / n : 0;
+    score = wsum > 0 ? (up - down) / wsum : 0;
 }
 
 int text_rotation(const cv::Mat& img, double ppm, std::string* info) {
@@ -500,7 +507,13 @@ int text_rotation(const cv::Mat& img, double ppm, std::string* info) {
     });
     // lines found upright vs upside down are the same lines: compare 0/180 with 90/270
     int hz = n[0] + n[2], vt = n[1] + n[3];
-    int best = hz >= vt ? (sc[0] >= sc[2] ? 0 : 2) : (sc[1] >= sc[3] ? 1 : 3);
+    int best;
+    if (hz >= vt) {
+        // the page frame comes from an upright phone, so keep it unless 180 wins clearly
+        best = sc[2] > sc[0] + 0.01 ? 2 : 0;
+    } else {
+        best = sc[1] >= sc[3] ? 1 : 3;
+    }
     if (info)
         *info = fmt("text lines %d horizontal, %d vertical; ascender score %+.2f / %+.2f", hz / 2, vt / 2,
                     hz >= vt ? sc[0] : sc[1], hz >= vt ? sc[2] : sc[3]);
