@@ -959,7 +959,21 @@ cv::Mat Session::Impl::solve_single() const {
             su.size()));
     for (auto& p : fl.st) p = rect_apply(rect, p);
     for (auto& p : fl.sto) p = rect_apply(rect, p);
-    return correct_render(fl);
+    cv::Mat out = correct_render(fl);
+    // A wrong page detection on a light background leaves background at the page edge: the
+    // outer 1.5 % of a real page is paper. Better to make the user retake than to save it.
+    {
+        cv::Mat g;
+        if (out.channels() == 3) cv::cvtColor(out, g, cv::COLOR_BGR2GRAY);
+        else g = out;
+        const int bh = std::max(4, (int)std::lround(0.015 * g.rows));
+        const int bw = std::max(4, (int)std::lround(0.015 * g.cols));
+        const double mt = cv::mean(g.rowRange(0, bh))[0], mb = cv::mean(g.rowRange(g.rows - bh, g.rows))[0];
+        const double ml = cv::mean(g.colRange(0, bw))[0], mr = cv::mean(g.colRange(g.cols - bw, g.cols))[0];
+        if (std::min({mt, mb, ml, mr}) < 200)
+            fail("the page is not fully on the photo: use a dark background and keep a small margin around the page");
+    }
+    return out;
 }
 
 }  // namespace docscan
