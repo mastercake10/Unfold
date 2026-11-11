@@ -138,17 +138,20 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
         phase = Phase.Processing
         progress = ""
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val out = File(outDir, "docscan_$stamp.png")
+        val tmp = File(outDir, "tmp_$stamp.png")
+        val out = ScanStore.newFile(getApplication(), stamp)
         val t0 = SystemClock.elapsedRealtime()  // what the user waits for, including photos still in analysis
         val tone = docTone
         worker.execute {
             val e = early
+            // render into the cache first; only a complete page is moved into the scan list
             val err = when {
                 accepted.isEmpty() -> "No usable photo."
                 accepted.size == 1 && e != null && earlyFor == accepted[0] && earlyTone == tone ->
-                    earlyErr ?: if (e.renameTo(out)) null else Native.finish(out.path, tone)
-                else -> Native.finish(out.path, tone)
+                    earlyErr ?: if (moveOrCopy(e, out)) null else Native.finish(tmp.path, tone)
+                else -> Native.finish(tmp.path, tone)
             }
+            if (err == null && tmp.exists()) moveOrCopy(tmp, out)
             early = null
             val sec = (SystemClock.elapsedRealtime() - t0) / 1000.0
             val log = Native.log()
@@ -159,11 +162,19 @@ class ScanModel(app: Application) : AndroidViewModel(app) {
                 logFile.writeText(log + "\nwait after last photo: %.1f s, thermal status %d\n".format(sec, thermal))
             }
             val notes = log.lines().filter { "leaving out" in it }.map { it.substringAfter("] ") }
-            val result = if (err != null) Phase.Failed(err)
-            else BitmapFactory.decodeFile(out.path)?.let { Phase.Done(out, it, sec, notes) }
-                ?: Phase.Failed("cannot read the result")
+            val result = if (err != null) {
+                tmp.delete()
+                out.delete()
+                Phase.Failed(err)
+            } else BitmapFactory.decodeFile(out.path)?.let { Phase.Done(out, it, sec, notes) }
+                ?: run { tmp.delete(); out.delete(); Phase.Failed("cannot read the result") }
             main.post { phase = result }
         }
+    }
+
+    private fun moveOrCopy(src: File, dst: File): Boolean {
+        if (src.renameTo(dst)) return true
+        return runCatching { src.copyTo(dst, overwrite = true); src.delete(); true }.getOrDefault(false)
     }
 
     fun pollProgress() {

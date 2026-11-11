@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -61,7 +62,7 @@ private fun pageOk(q: FloatArray): Boolean {
 }
 
 @Composable
-fun CaptureScreen(model: ScanModel) {
+fun CaptureScreen(model: ScanModel, onLibrary: () -> Unit) {
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
     val rig = remember { CameraRig(context) }
@@ -88,13 +89,16 @@ fun CaptureScreen(model: ScanModel) {
     val ok = q != null && pageOk(q)
 
     Column(Modifier.fillMaxSize().background(Color.Black)) {
-        Column(Modifier.padding(16.dp).height(96.dp)) {
-            Text(
-                "Page",
-                color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(CAPTURE_HINT, color = Color(0xFFDDDDDD), fontSize = 15.sp)
+        Row(Modifier.padding(16.dp).height(96.dp)) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    "Page",
+                    color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(CAPTURE_HINT, color = Color(0xFFDDDDDD), fontSize = 15.sp)
+            }
+            TextButton(onClick = onLibrary, enabled = !busy) { Text("Scans") }
         }
         Box(Modifier.fillMaxWidth().aspectRatio(3f / 4f)) {
             AndroidView({ previewView }, Modifier.fillMaxSize())

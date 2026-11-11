@@ -12,6 +12,9 @@ is saved to `Pictures/DocScan` or shared (e.g. to the Paperless app).
 - Live page outline (green: whole page in view). A photo that cannot be used (no page) is
   rejected at once with a message, and the user takes it again.
 - Result screen: pinch to zoom, drag to pan, double tap to toggle fit / 2.5x.
+- "Scans" on the camera screen lists every finished page in the app, newest first. Tap one to view it
+  (pinch-zoom, save, share, delete), or Select several and save them to Pictures/DocScan or share
+  them (e.g. to Paperless). Delete removes the app's copy; copies already in Pictures stay.
 - The output is turned so the text is upright.
 - The page analysis runs on the photo downscaled to 3200 px (the same page pixels/mm as the
   full-size 16:9 photos the pipeline was tuned on); rendering uses the full-size photo.

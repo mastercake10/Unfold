@@ -91,9 +91,15 @@ private fun App(model: ScanModel = viewModel()) {
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
     LaunchedEffect(Unit) { if (!granted) ask.launch(Manifest.permission.CAMERA) }
 
+    var library by remember { mutableStateOf(false) }
+    if (library) {
+        LibraryScreen(onClose = { library = false })
+        return
+    }
+
     when (val p = model.phase) {
         Phase.Capture ->
-            if (granted) CaptureScreen(model)
+            if (granted) CaptureScreen(model) { library = true }
             else Centered {
                 Text("DocScan needs the camera to photograph the page.", textAlign = TextAlign.Center)
                 Spacer(Modifier.height(16.dp))
@@ -101,7 +107,10 @@ private fun App(model: ScanModel = viewModel()) {
             }
 
         Phase.Processing -> ProcessingScreen(model)
-        is Phase.Done -> ResultScreen(p, onNew = { model.reset() }, onReport = { report(context, model) })
+        is Phase.Done -> ResultScreen(
+            p, onNew = { model.reset() }, onReport = { report(context, model) },
+            onLibrary = { library = true },
+        )
         is Phase.Failed -> {
             BackHandler { model.reset() }
             Centered {
@@ -153,7 +162,9 @@ private fun KeepScreenOn() {
 }
 
 @Composable
-private fun ResultScreen(r: Phase.Done, onNew: () -> Unit, onReport: () -> Unit) {
+private fun ResultScreen(
+    r: Phase.Done, onNew: () -> Unit, onReport: () -> Unit, onLibrary: () -> Unit,
+) {
     val context = LocalContext.current
     BackHandler(onBack = onNew)
     Column(Modifier.fillMaxSize()) {
@@ -169,7 +180,10 @@ private fun ResultScreen(r: Phase.Done, onNew: () -> Unit, onReport: () -> Unit)
             horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("%.1f s".format(r.seconds), color = Color.Gray)
-            TextButton(onClick = onReport) { Text("Send report") }
+            Row {
+                TextButton(onClick = onLibrary) { Text("All scans") }
+                TextButton(onClick = onReport) { Text("Send report") }
+            }
         }
         Row(
             Modifier.fillMaxWidth().padding(16.dp),
@@ -186,7 +200,7 @@ private fun ResultScreen(r: Phase.Done, onNew: () -> Unit, onReport: () -> Unit)
  * The flattened page, pinch-zoomed and panned; double tap toggles between fit and 2.5x.
  */
 @Composable
-private fun ZoomablePage(bitmap: Bitmap, modifier: Modifier = Modifier) {
+internal fun ZoomablePage(bitmap: Bitmap, modifier: Modifier = Modifier) {
     val image = remember(bitmap) { bitmap.asImageBitmap() }
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
@@ -241,16 +255,24 @@ private fun ZoomablePage(bitmap: Bitmap, modifier: Modifier = Modifier) {
 }
 
 /** Copies the PNG to Pictures/DocScan (no storage permission needed from Android 10). */
-private fun save(context: Context, file: File) {
+private fun saveFile(context: Context, file: File): Boolean {
+    if (!file.exists()) return false
     val values = ContentValues().apply {
         put(MediaStore.Images.Media.DISPLAY_NAME, file.name)
         put(MediaStore.Images.Media.MIME_TYPE, "image/png")
         put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/DocScan")
     }
-    val ok = runCatching {
+    return runCatching {
         val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
         context.contentResolver.openOutputStream(uri)!!.use { out -> file.inputStream().use { it.copyTo(out) } }
     }.isSuccess
+}
+
+/** Saves several pages to Pictures/DocScan; returns how many were written. */
+internal fun saveAll(context: Context, files: List<File>): Int = files.count { saveFile(context, it) }
+
+internal fun save(context: Context, file: File) {
+    val ok = saveFile(context, file)
     Toast.makeText(context, if (ok) "Saved to Pictures/DocScan" else "Saving failed", Toast.LENGTH_SHORT).show()
 }
 
@@ -266,7 +288,11 @@ private fun report(context: Context, model: ScanModel) {
     context.startActivity(Intent.createChooser(send, "Send report"))
 }
 
-private fun share(context: Context, file: File) {
+internal fun share(context: Context, file: File) {
+    if (!file.exists()) {
+        Toast.makeText(context, "The file is gone", Toast.LENGTH_SHORT).show()
+        return
+    }
     val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
     val send = Intent(Intent.ACTION_SEND).apply {
         type = "image/png"
@@ -274,4 +300,21 @@ private fun share(context: Context, file: File) {
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
     context.startActivity(Intent.createChooser(send, "Share scan"))
+}
+
+/** Shares one or several pages (the Paperless app accepts the multi-page intent). */
+internal fun shareMany(context: Context, files: List<File>) {
+    val ok = files.filter { it.exists() }
+    if (ok.isEmpty()) {
+        Toast.makeText(context, "The files are gone", Toast.LENGTH_SHORT).show()
+        return
+    }
+    if (ok.size == 1) return share(context, ok[0])
+    val uris = ArrayList(ok.map { FileProvider.getUriForFile(context, "${context.packageName}.files", it) })
+    val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+        type = "image/png"
+        putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(send, "Share scans"))
 }
