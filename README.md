@@ -62,3 +62,7 @@ without text or lines. Details: [cpp/README.md](cpp/README.md).
 | [android/](android/README.md) | the app (Kotlin, Compose, CameraX; JNI to the C++ pipeline) |
 | [cpp/](cpp/README.md) | the pipeline in C++ (OpenCV + Eigen), also as a command-line tool: `docscan page.jpg -o out` |
 | [python/](python/README.md) | the reference implementation: 2–4 photos with a measured 3D surface (about 2× more exact geometry than one photo, same OCR), used to develop and benchmark the pipeline, plus the evaluation tools |
+
+## License
+
+MIT, see [LICENSE](LICENSE). The app bundles OpenCV (Apache-2.0) and Eigen (MPL-2.0).
