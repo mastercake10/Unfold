@@ -1,0 +1,81 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths: ['android/**', 'cpp/**', '.github/workflows/android.yml']
+  pull_request:
+    paths: ['android/**', 'cpp/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # attach the APK to the release on tags
+
+env:
+  OPENCV_VERSION: 4.10.0
+  EIGEN_VERSION: 3.4.0
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - name: Android SDK packages
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1" > /dev/null
+
+      - name: Cache OpenCV and Eigen
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: deps
+          key: deps-opencv-${{ env.OPENCV_VERSION }}-eigen-${{ env.EIGEN_VERSION }}
+
+      - name: Download OpenCV Android SDK and Eigen
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p deps && cd deps
+          curl -sSfL -o opencv.zip "https://github.com/opencv/opencv/releases/download/$OPENCV_VERSION/opencv-$OPENCV_VERSION-android-sdk.zip"
+          unzip -q opencv.zip && rm opencv.zip
+          curl -sSfL "https://gitlab.com/libeigen/eigen/-/archive/$EIGEN_VERSION/eigen-$EIGEN_VERSION.tar.gz" | tar xz
+
+      # Same key on every build, so a new APK installs over the previous one. Without the secret
+      # a fresh debug key is made: that APK has to be uninstalled before the next one installs.
+      - name: Signing key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+            mkdir -p ~/.android && echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+          else
+            echo "::warning::DEBUG_KEYSTORE_B64 not set: APK signed with a throwaway key"
+          fi
+
+      - name: Build
+        working-directory: android
+        run: |
+          cat > local.properties <<EOF
+          sdk.dir=$ANDROID_HOME
+          opencv.dir=$GITHUB_WORKSPACE/deps/OpenCV-android-sdk/sdk/native/jni
+          eigen.dir=$GITHUB_WORKSPACE/deps/eigen-$EIGEN_VERSION
+          EOF
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/DocScan-${GITHUB_REF_NAME//\//-}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DocScan-apk
+          path: DocScan-*.apk
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" DocScan-*.apk --generate-notes
