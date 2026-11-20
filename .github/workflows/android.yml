@@ -67,15 +67,15 @@ jobs:
           eigen.dir=$GITHUB_WORKSPACE/deps/eigen-$EIGEN_VERSION
           EOF
           ./gradlew assembleRelease --no-daemon
-          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/DocScan-${GITHUB_REF_NAME//\//-}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/Unfold-${GITHUB_REF_NAME//\//-}.apk"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: DocScan-apk
-          path: DocScan-*.apk
+          name: Unfold-apk
+          path: Unfold-*.apk
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" DocScan-*.apk --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" Unfold-*.apk --generate-notes

@@ -110,7 +110,7 @@ private fun App(model: ScanModel = viewModel()) {
     if (granted) {
         CaptureScreen(model, onLibrary = { library = true }, onPage = { viewing = it }, onReport = { report(context, model) })
     } else Centered {
-        Text("DocScan needs the camera to photograph the page.", textAlign = TextAlign.Center)
+        Text("Unfold needs the camera to photograph the page.", textAlign = TextAlign.Center)
         Spacer(Modifier.height(16.dp))
         Button(onClick = { ask.launch(Manifest.permission.CAMERA) }) { Text("Allow camera") }
     }

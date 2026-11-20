@@ -18,7 +18,7 @@ import java.io.IOException
 import java.io.OutputStream
 import kotlin.math.roundToInt
 
-private fun pdfName(scan: ScanItem) = "DocScan_${scan.dir.name}.pdf"
+private fun pdfName(scan: ScanItem) = "Unfold_${scan.dir.name}.pdf"
 
 /** One PDF page per image, 595 pt (A4) wide; the image keeps its full resolution inside. */
 fun writePdf(pages: List<File>, out: OutputStream) {
@@ -38,12 +38,12 @@ fun writePdf(pages: List<File>, out: OutputStream) {
     }
 }
 
-/** Writes the scan as Download/DocScan/<name>.pdf (no storage permission needed from Android 10). */
+/** Writes the scan as Download/Unfold/<name>.pdf (no storage permission needed from Android 10). */
 private fun savePdf(context: Context, scan: ScanItem): Boolean {
     val values = ContentValues().apply {
         put(MediaStore.MediaColumns.DISPLAY_NAME, pdfName(scan))
         put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
-        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/DocScan")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Unfold")
     }
     val resolver = context.contentResolver
     val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
@@ -55,8 +55,8 @@ private fun savePdf(context: Context, scan: ScanItem): Boolean {
 suspend fun saveScans(context: Context, scans: List<ScanItem>) {
     val n = withContext(Dispatchers.IO) { scans.count { savePdf(context, it) } }
     val msg = when {
-        n == scans.size && n == 1 -> "Saved to Download/DocScan"
-        n == scans.size -> "Saved $n PDFs to Download/DocScan"
+        n == scans.size && n == 1 -> "Saved to Download/Unfold"
+        n == scans.size -> "Saved $n PDFs to Download/Unfold"
         else -> "Saved $n of ${scans.size} PDFs"
     }
     Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()

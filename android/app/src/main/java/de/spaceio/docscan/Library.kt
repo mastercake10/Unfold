@@ -86,7 +86,7 @@ fun LibraryScreen(onClose: () -> Unit) {
             TextButton(onClick = { confirm = true }) { Text("Delete") }
         }
         if (confirm) ConfirmDelete(
-            "Delete this scan?", "It is removed from the app. PDFs already saved to Download/DocScan stay.",
+            "Delete this scan?", "It is removed from the app. PDFs already saved to Download/Unfold stay.",
             onDismiss = { confirm = false },
         ) {
             v.dir.deleteRecursively()
@@ -206,7 +206,7 @@ fun LibraryScreen(onClose: () -> Unit) {
         val n = selected.size
         ConfirmDelete(
             "Delete $n scan${if (n == 1) "" else "s"}?",
-            "They are removed from the app. PDFs already saved to Download/DocScan stay.",
+            "They are removed from the app. PDFs already saved to Download/Unfold stay.",
             onDismiss = { confirmDelete = false },
         ) {
             selected.forEach { it.deleteRecursively() }

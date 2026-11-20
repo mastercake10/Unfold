@@ -1,7 +1,7 @@
-# DocScan for Android
+# Unfold for Android
 
 One photo per page, then the C++ pipeline (`../cpp/src`, via JNI) on the phone. The pages of a
-scan (one document) are saved to `Download/DocScan` as one PDF or shared as one PDF (e.g. to the
+scan (one document) are saved to `Download/Unfold` as one PDF or shared as one PDF (e.g. to the
 Paperless app).
 
 - Camera: back camera at 1x, 4:3 full resolution, shutter on the preview. Each photo is flattened

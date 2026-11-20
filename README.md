@@ -1,4 +1,4 @@
-# DocScan
+# Unfold – Document Scanner
 
 An Android scanner app for folded and curved letters: one photo per page → a flat, scanner-like
 page, all pages of a document → one PDF. Everything runs on the phone, offline.
@@ -9,7 +9,7 @@ page, all pages of a document → one PDF. Everything runs on the phone, offline
 
 Most scanner apps find the four page corners and apply a perspective transform (a homography).
 That fixes the camera angle but not the paper: folds and curls stay bent, text lines wave, and the
-fold shading stays in the image. DocScan corrects the page itself:
+fold shading stays in the image. Unfold corrects the page itself:
 
 - **Folds and curls are straightened.** The curved paper edge is measured to subpixel and pulled
   onto the A4 rectangle; printed lines and text lines are made straight, with the content between
@@ -31,7 +31,7 @@ fold shading stays in the image. DocScan corrects the page itself:
   the shutter on the preview.
 - One photo per page. Each page is processed in the background, so you can take the next page right
   away; the pages of the current scan are shown in a strip below the preview.
-- Save the scan as one PDF to `Download/DocScan`, or share it (e.g. to Paperless).
+- Save the scan as one PDF to `Download/Unfold`, or share it (e.g. to Paperless).
 - All scans stay in the app's list until you delete them; view, save, share or delete them later.
 
 **Download:** no release yet. For now, build it yourself (no Android Studio needed):
