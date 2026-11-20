@@ -1,6 +1,6 @@
 # docscan (C++ port)
 
-Minimal C++ port of `docscan3d.py`, as the basis for the Android app. Same pipeline and
+Minimal C++ port of the Python reference (`../python/docscan3d.py`, [../python/README.md](../python/README.md)), as the basis for the Android app. Same pipeline and
 defaults; left out: ASIFT fallback for very steep folds (`--asift`), view fusion (`--fuse`), lens
 distortion / calibration files, debug outputs and most flags. Output is `flat.png` only.
 

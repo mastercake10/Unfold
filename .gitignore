@@ -1,8 +1,8 @@
 env/
 samples/
 samples_one_view/
-test/out
-test/real
-test/synth
+python/test/out
+python/test/real
+python/test/synth
 __pycache__
 cpp/build/
