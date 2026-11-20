@@ -17,9 +17,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
-/** Settings that apply to the next scans. */
+/** Settings that apply to the next pages, and the debug report. */
 @Composable
-fun SettingsDialog(model: ScanModel, onClose: () -> Unit) {
+fun SettingsDialog(model: ScanModel, onReport: () -> Unit, onClose: () -> Unit) {
     AlertDialog(
         onDismissRequest = onClose,
         confirmButton = { TextButton(onClick = onClose) { Text("Done") } },
@@ -31,6 +31,7 @@ fun SettingsDialog(model: ScanModel, onClose: () -> Unit) {
                     "Black text on white paper, best for OCR. Turn off for pages with light grey print, which it fades.",
                     model.docTone,
                 ) { model.changeDocTone(it) }
+                TextButton(onClick = { onClose(); onReport() }) { Text("Send report (photos + log)") }
             }
         },
     )

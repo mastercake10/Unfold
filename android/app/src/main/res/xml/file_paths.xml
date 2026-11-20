@@ -3,4 +3,5 @@
     <files-path name="scans" path="scans/" />
     <cache-path name="out" path="out/" />
     <cache-path name="shots" path="shots/" />
+    <cache-path name="export" path="export/" />
 </paths>

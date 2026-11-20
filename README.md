@@ -5,7 +5,7 @@ One photo of a folded or curved page → flat, scanner-like image.
 ![One photo of a curved page → flat, scanner-like page](docs/example.jpg)
 
 - **Android app** — [android/README.md](android/README.md): one photo on the phone, live page
-  outline, flash, pinch-zoom, a scan list with save/share, 200 dpi A4 PNG.
+  outline, flash, pinch-zoom, several pages per scan, a scan list, save/share as PDF (200 dpi A4).
 - **C++ command line** — [cpp/README.md](cpp/README.md): the same one-photo pipeline on a computer,
   `flat.png` only.
 - **Python reference** — this file: 2–4 views with a measured 3D surface; used to develop and
@@ -84,7 +84,7 @@ reference.
 | `overlay.jpg` | view 1 with detected page and points colored by height |
 | `report.json` | point count, reprojection error, baseline, distance, strain, ... |
 
-The C++ CLI writes only `flat.png`; the app writes the final PNG (A4, 200 dpi) to its result screen.
+The C++ CLI writes only `flat.png`; the app keeps one PNG (A4, 200 dpi) per page and exports a scan as one PDF.
 
 ## Output
 

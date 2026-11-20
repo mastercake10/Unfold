@@ -2,7 +2,23 @@ package de.spaceio.docscan
 
 import android.widget.Toast
 import androidx.camera.view.PreviewView
+import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -62,15 +78,17 @@ private fun pageOk(q: FloatArray): Boolean {
 }
 
 @Composable
-fun CaptureScreen(model: ScanModel, onLibrary: () -> Unit) {
+fun CaptureScreen(model: ScanModel, onLibrary: () -> Unit, onPage: (Int) -> Unit, onReport: () -> Unit) {
     val context = LocalContext.current
     val owner = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
     val rig = remember { CameraRig(context) }
     var quad by remember { mutableStateOf<FloatArray?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var exporting by remember { mutableStateOf(false) }
     var settings by remember { mutableStateOf(false) }
     var flashUnit by remember { mutableStateOf(false) }
-    if (settings) SettingsDialog(model) { settings = false }
+    if (settings) SettingsDialog(model, onReport) { settings = false }
     val previewView = remember {
         PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
     }
@@ -81,26 +99,27 @@ fun CaptureScreen(model: ScanModel, onLibrary: () -> Unit) {
         onDispose { rig.release() }
     }
 
-    val n = model.shots.size
-    // first photo gone (rejected): measure focus again for the next one
-    LaunchedEffect(n == 0) { if (n == 0) rig.unlockFocus() }
+    val pages = model.pages
+    val pending = model.pending
+    if (pending > 0) KeepScreenOn()
     LaunchedEffect(model.flashOn) { rig.setFlashMode(model.flashOn) }
     val q = quad
     val ok = q != null && pageOk(q)
 
     Column(Modifier.fillMaxSize().background(Color.Black)) {
-        Row(Modifier.padding(16.dp).height(96.dp)) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    "Page",
-                    color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(CAPTURE_HINT, color = Color(0xFFDDDDDD), fontSize = 15.sp)
-            }
+        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (pages.isEmpty()) "New scan" else "Scan · ${pages.size} page${if (pages.size == 1) "" else "s"}",
+                color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+            )
             TextButton(onClick = onLibrary, enabled = !busy) { Text("Scans") }
         }
-        Box(Modifier.fillMaxWidth().aspectRatio(3f / 4f)) {
+        // shrinks on short screens so the page strip and the buttons below stay visible
+        Box(
+            Modifier.weight(1f, fill = false).aspectRatio(3f / 4f, matchHeightConstraintsFirst = true)
+                .align(Alignment.CenterHorizontally)
+        ) {
             AndroidView({ previewView }, Modifier.fillMaxSize())
             Canvas(Modifier.fillMaxSize()) {
                 if (q != null) {
@@ -115,13 +134,13 @@ fun CaptureScreen(model: ScanModel, onLibrary: () -> Unit) {
             }
             Text(
                 when {
+                    busy -> "Taking the photo …"
                     q == null -> "No page found – dark background helps"
                     !ok -> "Keep the whole page in view"
-                    rig.focusLocked -> "Page OK · focus locked"
                     else -> "Page OK"
                 },
                 color = if (ok) Ok else Warn, fontSize = 14.sp,
-                modifier = Modifier.align(Alignment.BottomCenter).padding(8.dp)
+                modifier = Modifier.align(Alignment.TopCenter).padding(horizontal = 64.dp, vertical = 12.dp)
                     .background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(8.dp, 4.dp),
             )
             IconButton(
@@ -138,35 +157,14 @@ fun CaptureScreen(model: ScanModel, onLibrary: () -> Unit) {
                     FlashIcon(model.flashOn)
                 }
             }
-        }
-        model.notice?.let {
-            Text(
-                it, color = Warn, fontSize = 14.sp,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-            )
-        }
-        if (busy) {
-            Text(
-                "focusing and taking the photo …", color = Color.Gray, fontSize = 13.sp,
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
-        } else if (model.pending > 0) {
-            Text(
-                "analysing photo …", color = Color.Gray, fontSize = 13.sp,
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
-        }
-        Spacer(Modifier.weight(1f))
-        Row(
-            Modifier.fillMaxWidth().padding(bottom = 24.dp),
-            horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically,
-        ) {
             Box(
-                Modifier.size(76.dp).clip(CircleShape)
-                    .clickable(enabled = !busy && n == 0) {
+                Modifier.align(Alignment.BottomCenter).padding(bottom = 20.dp)
+                    .size(76.dp).clip(CircleShape)
+                    .clickable(enabled = !busy) {
                         busy = true
                         val file = model.nextShotFile()
-                        rig.shoot(file, lockAfter = n == 0) { r ->
+                        // no focus lock: every page is focused on its own
+                        rig.shoot(file, lockAfter = false) { r ->
                             busy = false
                             r.onSuccess { sz ->
                                 model.addShot(file, rig.focalPx(sz.width, sz.height))
@@ -177,9 +175,75 @@ fun CaptureScreen(model: ScanModel, onLibrary: () -> Unit) {
                     }
                     // the whole button reacts, including the outer ring
                     .border(4.dp, Color.White, CircleShape).padding(8.dp)
-                    .clip(CircleShape).background(if (busy || n > 0) Color.Gray else Color.White)
+                    .clip(CircleShape).background(if (busy) Color.Gray else Color.White)
             )
         }
+        model.notice?.let {
+            Text(
+                it, color = Warn, fontSize = 14.sp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+        }
+        if (pages.isEmpty()) {
+            Text(
+                CAPTURE_HINT, color = Color(0xFFDDDDDD), fontSize = 15.sp,
+                modifier = Modifier.padding(16.dp),
+            )
+        } else {
+            val strip = rememberLazyListState()
+            LaunchedEffect(pages.size) { strip.animateScrollToItem(pages.size - 1) }
+            LazyRow(
+                state = strip,
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                itemsIndexed(pages, key = { _, p -> p.id }) { i, p ->
+                    PageThumb(p, i + 1) {
+                        // viewer index counts finished pages only
+                        onPage(pages.subList(0, i).count { it.file != null })
+                    }
+                }
+            }
+        }
+        if (pages.isNotEmpty()) {
+            val canExport = pending == 0 && !exporting
+            fun export(action: suspend (android.content.Context, List<ScanItem>) -> Unit) {
+                val scan = model.current() ?: return
+                exporting = true
+                scope.launch { action(context, listOf(scan)); exporting = false }
+            }
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
+                OutlinedButton(onClick = { model.newScan() }, enabled = !busy) { Text("New scan") }
+                OutlinedButton(onClick = { export(::saveScans) }, enabled = canExport) { Text("Save PDF") }
+                Button(onClick = { export(::shareScans) }, enabled = canExport) { Text("Share PDF") }
+            }
+        }
+    }
+}
+
+/** Page of the current scan in the strip; a spinner while it is processed. */
+@Composable
+private fun PageThumb(page: Page, number: Int, onClick: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            Modifier.height(112.dp).aspectRatio(210f / 297f).clip(RoundedCornerShape(6.dp))
+                .background(Color(0xFF222222)).clickable(enabled = page.file != null, onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            val f = page.file
+            if (f == null) {
+                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+            } else {
+                val bmp by produceState<Bitmap?>(null, f.path) {
+                    value = withContext(Dispatchers.IO) { ScanStore.thumb(f, 400) }
+                }
+                bmp?.let { Image(it.asImageBitmap(), "page $number", Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
+            }
+        }
+        Text("$number", color = Color.Gray, fontSize = 12.sp)
     }
 }
 

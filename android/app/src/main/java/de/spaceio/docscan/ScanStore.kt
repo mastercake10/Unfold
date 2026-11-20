@@ -8,54 +8,70 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** One flattened page kept in the app's scan list. */
-data class ScanItem(val file: File, val date: Date)
+/** One scan (a document): its folder and its flattened pages in order. */
+data class ScanItem(val dir: File, val date: Date, val pages: List<File>)
 
 /**
- * Finished scans live in the app's private files dir, one PNG per page, so they stay until the user
- * deletes them. Export (Pictures / share) copies them out; the original stays in the list.
+ * Finished scans live in the app's private files dir, one folder per scan with one PNG per page, so
+ * they stay until the user deletes them. Export (PDF to Downloads / share) leaves them in the list.
  */
 object ScanStore {
-    private val stampFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
-    private val nameRe = Regex("""docscan_(\d{8}_\d{6})(?:_\d+)?\.png""")
+    private val stampRe = Regex("""(\d{8}_\d{6})(?:_\d+)?""")
+    private val pageRe = Regex("""page(\d+)\.png""")
+    // single pages of older builds: in the scans dir, or even older, in the cache
+    private val oldPageRe = Regex("""docscan_(\d{8}_\d{6}(?:_\d+)?)\.png""")
+
+    private fun stampFmt() = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)  // not thread-safe: one per call
 
     fun dir(context: Context): File = File(context.filesDir, "scans").apply { mkdirs() }
 
-    /** New, unused file for a scan finished at [stamp]. */
-    fun newFile(context: Context, stamp: String): File {
-        val d = dir(context)
-        var f = File(d, "docscan_$stamp.png")
+    /** New, empty folder for a scan started now. */
+    fun newScanDir(context: Context): File {
+        val stamp = stampFmt().format(Date())
+        var d = File(dir(context), stamp)
         var n = 2
-        while (f.exists()) f = File(d, "docscan_${stamp}_${n++}.png")
-        return f
+        while (d.exists()) d = File(dir(context), "${stamp}_${n++}")
+        d.mkdirs()
+        return d
     }
 
+    /** File for page number [n] (only the order of the numbers matters, gaps are fine). */
+    fun pageFile(scanDir: File, n: Int) = File(scanDir, "page%03d.png".format(n))
+
+    fun pages(scanDir: File): List<File> =
+        scanDir.listFiles { f -> f.isFile && pageRe.matches(f.name) }
+            ?.sortedBy { pageRe.matchEntire(it.name)!!.groupValues[1].toInt() }
+            ?: emptyList()
+
+    /** All scans with at least one page, newest first. */
     fun list(context: Context): List<ScanItem> {
-        importCache(context)
-        return dir(context).listFiles { f -> f.isFile && f.name.endsWith(".png", true) }
-            ?.map { ScanItem(it, dateOf(it)) }
+        migrate(context)
+        return dir(context).listFiles { f -> f.isDirectory }
+            ?.map { ScanItem(it, dateOf(it), pages(it)) }
+            ?.filter { it.pages.isNotEmpty() }
             ?.sortedByDescending { it.date }
             ?: emptyList()
     }
 
-    /** Keep finished pages that an older build left in the cache (before the scan list existed). */
-    private fun importCache(context: Context) {
-        val old = File(context.cacheDir, "out")
-        val re = Regex("""docscan_\d{8}_\d{6}(?:_\d+)?\.png""")
-        old.listFiles { f -> f.isFile && re.matches(f.name) }?.forEach { f ->
-            val dst = File(dir(context), f.name)
-            if (dst.exists()) {
-                f.delete()  // duplicate of a page already in the list
-                return@forEach
+    /** Older builds kept loose single pages: each becomes a one-page scan. */
+    private fun migrate(context: Context) {
+        for (src in listOf(dir(context), File(context.cacheDir, "out"))) {
+            src.listFiles { f -> f.isFile && oldPageRe.matches(f.name) }?.forEach { f ->
+                val dst = pageFile(File(dir(context), oldPageRe.matchEntire(f.name)!!.groupValues[1]), 1)
+                if (dst.exists()) {
+                    f.delete()  // already moved before
+                    return@forEach
+                }
+                dst.parentFile!!.mkdirs()
+                runCatching { if (!f.renameTo(dst)) { f.copyTo(dst); f.delete() } }
             }
-            runCatching { if (!f.renameTo(dst)) f.copyTo(dst, overwrite = false) }
         }
     }
 
-    fun dateOf(f: File): Date {
-        val m = nameRe.matchEntire(f.name)
-        if (m != null) runCatching { return stampFmt.parse(m.groupValues[1])!! }
-        return Date(f.lastModified())
+    fun dateOf(scanDir: File): Date {
+        val m = stampRe.matchEntire(scanDir.name)
+        if (m != null) runCatching { return stampFmt().parse(m.groupValues[1])!! }
+        return Date(scanDir.lastModified())
     }
 
     /** Downsampled page for the grid; null if the file cannot be decoded. */
