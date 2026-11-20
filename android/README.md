@@ -45,5 +45,12 @@ eigen.dir=/opt/eigen-3.4.0
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
-The release APK is signed with the debug key (no release keystore yet), so it installs directly
-but cannot be uploaded to Play.
+Release builds are signed with the release key when `RELEASE_KEYSTORE` (path) and
+`RELEASE_KEYSTORE_PASSWORD` are set in the environment or in `local.properties` (key alias
+`unfold`, one password for store and key); otherwise with the debug key. APKs signed with
+different keys cannot update each other.
+
+CI (`.github/workflows/android.yml`) builds the APK on every push; a `v*` tag publishes it as a
+GitHub release. It needs the secrets `RELEASE_KEYSTORE_B64` (`base64 -w0` of the keystore) and
+`RELEASE_KEYSTORE_PASSWORD`; without them it signs with a throwaway key and refuses to release.
+Before each release raise `versionCode` and `versionName` in `app/build.gradle.kts`.

@@ -34,8 +34,8 @@ fold shading stays in the image. Unfold corrects the page itself:
 - Save the scan as one PDF to `Download/Unfold`, or share it (e.g. to Paperless).
 - All scans stay in the app's list until you delete them; view, save, share or delete them later.
 
-**Download:** no release yet. For now, build it yourself (no Android Studio needed):
-[android/README.md](android/README.md). Android 10 or newer, 64-bit ARM phones.
+**Download:** the APK is on the [releases page](../../releases/latest). Android 10 or newer,
+64-bit ARM phones. To build it yourself (no Android Studio needed): [android/README.md](android/README.md).
 
 Tips: put the page on a darker surface, fill the frame with it, and keep the whole page in view.
 

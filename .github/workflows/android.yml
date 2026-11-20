@@ -46,16 +46,22 @@ jobs:
           unzip -q opencv.zip && rm opencv.zip
           curl -sSfL "https://gitlab.com/libeigen/eigen/-/archive/$EIGEN_VERSION/eigen-$EIGEN_VERSION.tar.gz" | tar xz
 
-      # Same key on every build, so a new APK installs over the previous one. Without the secret
-      # a fresh debug key is made: that APK has to be uninstalled before the next one installs.
+      # The release key signs every build, so each APK installs over the previous one. Without the
+      # secrets (e.g. pull requests from forks) a throwaway debug key is used; releases refuse that.
       - name: Signing key
         env:
-          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+          RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
         run: |
-          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
-            mkdir -p ~/.android && echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+          if [ -n "$RELEASE_KEYSTORE_B64" ]; then
+            echo "$RELEASE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "RELEASE_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "RELEASE_KEYSTORE_PASSWORD=$RELEASE_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "::error::RELEASE_KEYSTORE_B64 not set: refusing to publish a release with a throwaway key"
+            exit 1
           else
-            echo "::warning::DEBUG_KEYSTORE_B64 not set: APK signed with a throwaway key"
+            echo "::warning::RELEASE_KEYSTORE_B64 not set: APK signed with a throwaway debug key"
           fi
 
       - name: Build

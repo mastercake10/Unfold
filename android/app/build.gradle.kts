@@ -12,6 +12,9 @@ val localProps = Properties().apply {
 }
 val opencvDir = localProps.getProperty("opencv.dir") ?: "/opt/opencv-android/sdk/native/jni"
 val eigenDir = localProps.getProperty("eigen.dir") ?: "/opt/eigen-3.4.0"
+// release key: environment (CI) or local.properties; without it release builds use the debug key
+fun secret(name: String): String? = System.getenv(name) ?: localProps.getProperty(name)
+val releaseKeystore = secret("RELEASE_KEYSTORE")
 
 android {
     namespace = "de.spaceio.docscan"
@@ -34,11 +37,21 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            if (releaseKeystore != null) {
+                storeFile = file(releaseKeystore)
+                storePassword = secret("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = "unfold"
+                keyPassword = storePassword  // PKCS12: one password for store and key
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // no release keystore yet: sign with the debug key so the APK installs directly
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (releaseKeystore != null) "release" else "debug")
         }
     }
     externalNativeBuild {

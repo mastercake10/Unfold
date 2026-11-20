@@ -6,3 +6,5 @@ python/test/real
 python/test/synth
 __pycache__
 cpp/build/
+.devenv/
+CLAUDE.md
