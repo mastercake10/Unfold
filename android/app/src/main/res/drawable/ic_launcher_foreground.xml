@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Converted from docs/icon.svg (12.7 x 12.7 units); content scaled into the 108 dp adaptive-icon
+     canvas so the corners stay visible under a round launcher mask. Background colour: ic_launcher.xml. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <group android:scaleX="5.2" android:scaleY="5.2" android:translateX="20.98" android:translateY="20.98">
+        <!-- viewfinder corners -->
+        <path android:strokeColor="#FFFFFF" android:strokeWidth="0.6" android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M3.7408569,1.289327h-1.418518c-0.6585769,0 -1.188558,0.5299811 -1.188558,1.1885579v1.3559896" />
+        <path android:strokeColor="#FFFFFF" android:strokeWidth="0.6" android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M1.1337809,8.8681925v1.3239505c0,0.658577 0.5299811,1.188558 1.188558,1.188558h1.418518" />
+        <path android:strokeColor="#FFFFFF" android:strokeWidth="0.6" android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M8.9591431,11.380701h1.2329999c0.658577,0 1.188558,-0.529981 1.188558,-1.188558V8.867159" />
+        <path android:strokeColor="#FFFFFF" android:strokeWidth="0.6" android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:pathData="M11.380701,3.832841V2.4778849c0,-0.6585768 -0.529981,-1.1885579 -1.188558,-1.1885579H8.9591431" />
+        <!-- folded page -->
+        <path android:fillColor="#F8F8F8"
+            android:pathData="M3.1267148,2.6312842L2.3484355,5.0354312 3.7710877,7.643024 2.8172357,10.160072 9.5761635,10.144355 10.18465,7.643024 8.6793152,5.0354312 9.238971,2.6312842Z" />
+        <path android:fillColor="#D1D1D1"
+            android:pathData="M2.3484354,5.0354312H8.6793152L10.18465,7.643024H3.7710875Z" />
+        <!-- scan line with its fading glow -->
+        <path android:strokeColor="#FF0000" android:strokeWidth="0.320361"
+            android:pathData="M1.2010339,5.9905043H11.379551" />
+        <path android:pathData="M1.2010339,5.9905043h10.178517v4.1614909h-10.178517Z">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="linear" android:startX="6.586" android:startY="3.0472"
+                    android:endX="6.586" android:endY="10.1522"
+                    android:startColor="#FFFF0000" android:endColor="#00FF0000" />
+            </aapt:attr>
+        </path>
+        <!-- text and logo on the page -->
+        <group android:translateX="0.11788266" android:translateY="0.09430549">
+            <path android:strokeColor="#D2D2D2" android:strokeWidth="0.221" android:strokeLineCap="round"
+                android:pathData="M3.3009682,3.202582l1.6955329,0.00107" />
+            <path android:strokeColor="#D2D2D2" android:strokeWidth="0.221" android:strokeLineCap="round"
+                android:pathData="M3.1506979,3.6260866L4.857708,3.6243115" />
+            <path android:fillColor="#D2D2D2"
+                android:pathData="M7.27947,2.9907297l1.3858078,0.00206l-0.4024794,1.4532309l-1.4179162,0.00618Z" />
+        </group>
+    </group>
+</vector>
