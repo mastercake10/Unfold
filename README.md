@@ -37,7 +37,8 @@ fold shading stays in the image. Unfold corrects the page itself:
 **Download:** the APK is on the [releases page](../../releases/latest). Android 10 or newer,
 64-bit ARM phones. To build it yourself (no Android Studio needed): [android/README.md](android/README.md).
 
-Tips: put the page on a darker surface, fill the frame with it, and keep the whole page in view.
+Tips: a darker or coloured surface works best (a light wooden desk is fine; a white desk often is
+not), fill the frame with the page and keep all of it in view.
 
 ## How it works
 

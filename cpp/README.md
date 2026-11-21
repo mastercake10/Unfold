@@ -32,6 +32,11 @@ is darkened rather than faded. Over 9 test pages OCR is unchanged by it (tessera
 92.1 vs 93.0 %, psm 6: 89.7 vs 89.3 %); a plain global curve lost 10 % of a form's fine print.
 The output is turned so the text is upright (text line direction, ascenders vs descenders); `--no-rotate` turns that off.
 
+Page detection (`find_page_quad`): the brightest region if its outline lies on a paper edge
+(dark desks); else the bright, colourless region (white paper on wood or a coloured desk); else
+the best quadrilateral of long straight edges whose sides have whiter paper inside and no print
+right outside (rules out folds and printed lines). Desks as white as the paper still fail.
+
 Library API (`src/docscan.hpp`): `cv::Mat docscan::process(images, options)`; throws
 `std::runtime_error` with a user-facing message (1 to 8 photos). The CLI reads the focal length from EXIF
 (`FocalLengthIn35mmFilm`); in the app, pass `Options::focal_px` from the camera characteristics.

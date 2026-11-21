@@ -16,51 +16,14 @@ namespace docscan {
 
 // ------------------------------------------------------------ page
 
-// Largest bright region, approximated by a quadrilateral (tl, tr, br, bl).
-bool find_page_quad(const cv::Mat& img, std::array<Vec2, 4>& quad, cv::Mat& mask, int work_side) {
-    cv::Mat g, sm, th;
-    if (img.channels() == 3) cv::cvtColor(img, g, cv::COLOR_BGR2GRAY);
-    else g = img;
-    double small_s = (double)work_side / std::max(g.rows, g.cols);
-    cv::resize(g, sm, cv::Size(), small_s, small_s, cv::INTER_AREA);
-    auto ks = [&](int k) { return 2 * (int)std::lround((k - 1) / 2.0 * work_side / 1000.0) + 1; };  // odd, scaled
-    // close text strokes so the page becomes one blob
-    cv::morphologyEx(sm, sm, cv::MORPH_CLOSE, cv::Mat::ones(ks(25), ks(25), CV_8U));
-    cv::GaussianBlur(sm, th, cv::Size(ks(9), ks(9)), 0);
-    cv::threshold(th, th, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
-    cv::morphologyEx(th, th, cv::MORPH_OPEN, cv::Mat::ones(ks(15), ks(15), CV_8U));
-    std::vector<std::vector<cv::Point>> cnts;
-    cv::findContours(th, cnts, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    if (cnts.empty()) return false;
-    size_t best = 0;
-    for (size_t i = 1; i < cnts.size(); i++)
-        if (cv::contourArea(cnts[i]) > cv::contourArea(cnts[best])) best = i;
-    const auto& c = cnts[best];
-    if (cv::contourArea(c) < 0.1 * sm.total()) return false;
-    cv::Mat msmall = cv::Mat::zeros(sm.size(), CV_8U);
-    cv::drawContours(msmall, cnts, (int)best, 255, -1);
-    cv::resize(msmall, mask, g.size(), 0, 0, cv::INTER_NEAREST);
+// Page quad (tl, tr, br, bl) and page mask. Candidates: the largest bright region (grey
+// level; and "whiteness" = grey minus colour saturation, which separates white paper from a
+// light wooden or coloured desk), and quadrilaterals of long straight edges (LSD), for desks
+// as bright as the paper (only tried when no region fits). Each candidate is scored by how much
+// of its outline lies on an edge; the largest well-supported one wins.
+namespace {
 
-    std::vector<cv::Point> hull;
-    cv::convexHull(c, hull);
-    double peri = cv::arcLength(hull, true);
-    std::vector<cv::Point2d> q;
-    for (int k = 0; k < 15; k++) {
-        double eps = 0.01 + k * (0.07 / 14);
-        std::vector<cv::Point> ap;
-        cv::approxPolyDP(hull, ap, eps * peri, true);
-        if (ap.size() == 4) {
-            for (auto& p : ap) q.emplace_back(p.x, p.y);
-            break;
-        }
-    }
-    if (q.empty()) {
-        cv::Point2f bp[4];
-        cv::minAreaRect(c).points(bp);
-        for (auto& p : bp) q.emplace_back(p.x, p.y);
-    }
-    std::array<Vec2, 4> Q;
-    for (int k = 0; k < 4; k++) Q[k] = Vec2(q[k].x, q[k].y) / small_s;
+std::array<Vec2, 4> order_quad(const std::vector<Vec2>& Q) {
     auto arg = [&](auto key, bool mx) {
         int b = 0;
         for (int k = 1; k < 4; k++)
@@ -69,7 +32,264 @@ bool find_page_quad(const cv::Mat& img, std::array<Vec2, 4>& quad, cv::Mat& mask
     };
     auto sum = [](const Vec2& p) { return p.x() + p.y(); };
     auto diff = [](const Vec2& p) { return p.y() - p.x(); };
-    quad = {Q[arg(sum, false)], Q[arg(diff, false)], Q[arg(sum, true)], Q[arg(diff, true)]};
+    return {Q[arg(sum, false)], Q[arg(diff, false)], Q[arg(sum, true)], Q[arg(diff, true)]};
+}
+
+// largest region of a binary image as a quadrilateral (in cycle order) and its mask
+bool blob_quad(const cv::Mat& th, std::vector<Vec2>& q, cv::Mat& mask) {
+    std::vector<std::vector<cv::Point>> cnts;
+    cv::findContours(th.clone(), cnts, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    if (cnts.empty()) return false;
+    size_t best = 0;
+    for (size_t i = 1; i < cnts.size(); i++)
+        if (cv::contourArea(cnts[i]) > cv::contourArea(cnts[best])) best = i;
+    const auto& c = cnts[best];
+    if (cv::contourArea(c) < 0.1 * th.total()) return false;
+    mask = cv::Mat::zeros(th.size(), CV_8U);
+    cv::drawContours(mask, cnts, (int)best, 255, -1);
+    std::vector<cv::Point> hull;
+    cv::convexHull(c, hull);
+    double peri = cv::arcLength(hull, true);
+    q.clear();
+    for (int k = 0; k < 15; k++) {
+        std::vector<cv::Point> ap;
+        cv::approxPolyDP(hull, ap, (0.01 + k * (0.07 / 14)) * peri, true);
+        if (ap.size() == 4) {
+            for (auto& p : ap) q.emplace_back(p.x, p.y);
+            return true;
+        }
+    }
+    cv::Point2f bp[4];
+    cv::minAreaRect(c).points(bp);
+    for (auto& p : bp) q.emplace_back(p.x, p.y);
+    return true;
+}
+
+struct Line {
+    Vec2 n;      // unit normal, n.x = rho
+    double rho, len;
+};
+
+bool intersect(const Line& a, const Line& b, Vec2& p) {
+    double det = a.n.x() * b.n.y() - a.n.y() * b.n.x();
+    if (std::abs(det) < 0.3) return false;  // < ~17 deg apart
+    p = Vec2((a.rho * b.n.y() - b.rho * a.n.y()) / det, (a.n.x() * b.rho - b.n.x() * a.rho) / det);
+    return true;
+}
+
+}  // namespace
+
+bool find_page_quad(const cv::Mat& img, std::array<Vec2, 4>& quad, cv::Mat& mask, int work_side) {
+    cv::Mat g, sm, smc, th, wt;
+    if (img.channels() == 3) cv::cvtColor(img, g, cv::COLOR_BGR2GRAY);
+    else g = img;
+    double small_s = (double)work_side / std::max(g.rows, g.cols);
+    cv::resize(g, sm, cv::Size(), small_s, small_s, cv::INTER_AREA);
+    auto ks = [&](int k) { return 2 * (int)std::lround((k - 1) / 2.0 * work_side / 1000.0) + 1; };  // odd, scaled
+    const double u = work_side / 1000.0;  // pixel lengths below are for a 1000 px image
+    // whiteness: grey minus saturation (the camera preview passes grey only)
+    if (img.channels() == 3) {
+        cv::resize(img, smc, sm.size(), 0, 0, cv::INTER_AREA);
+        cv::Mat hsv, ch[3];
+        cv::cvtColor(smc, hsv, cv::COLOR_BGR2HSV);
+        cv::split(hsv, ch);
+        cv::subtract(sm, ch[1], wt);
+    } else {
+        wt = sm.clone();
+    }
+    cv::GaussianBlur(wt, wt, cv::Size(0, 0), 1.5 * u);
+    cv::Mat gx, gy, wf, bh;  // bh: dark print (black-hat)
+    cv::morphologyEx(sm, bh, cv::MORPH_BLACKHAT, cv::Mat::ones(ks(9), ks(9), CV_8U));
+    bh.convertTo(bh, CV_32F);
+    wt.convertTo(wf, CV_32F);
+    cv::Sobel(wt, gx, CV_32F, 1, 0);
+    cv::Sobel(wt, gy, CV_32F, 0, 1);
+
+    // A point of an outline is on the paper edge if the gradient across it is strong within
+    // +-4 px; its contrast is the whiter of 3 band samples 6-18 px inside minus the same outside
+    // (text lines and print inside the page do not count).
+    const int win = std::max(1, (int)std::lround(4 * u));
+    auto on_edge = [&](const Vec2& p, const Vec2& nrm) {  // nrm: inward
+        for (int o = -win; o <= win; o++) {
+            Vec2 x = p + o * nrm;
+            if (std::abs(sample_clamped(gx, x.x(), x.y()) * nrm.x() + sample_clamped(gy, x.x(), x.y()) * nrm.y()) > 24)
+                return true;
+        }
+        return false;
+    };
+    auto contrast = [&](const Vec2& p, const Vec2& nrm) {
+        double in = 0, out = 0;
+        for (int o = 6; o <= 18; o += 6) {
+            Vec2 pi = p + o * u * nrm, po = p - o * u * nrm;
+            in = std::max(in, (double)sample_clamped(wf, pi.x(), pi.y()));
+            out = std::max(out, (double)sample_clamped(wf, po.x(), po.y()));
+        }
+        return in - out;
+    };
+    auto ink_out = [&](const Vec2& p, const Vec2& nrm) {  // print 8-32 px outside
+        int k = 0;
+        for (int o = 8; o <= 32; o += 6) {
+            Vec2 x = p - o * u * nrm;
+            k += sample_clamped(bh, x.x(), x.y()) > 25;
+        }
+        return k;
+    };
+    auto median = [](std::vector<double>& v) {
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        return v[v.size() / 2];
+    };
+    // share of a region's outline on the paper edge with no print right outside (0 if the paper is
+    // not whiter inside)
+    auto region_support = [&](const cv::Mat& m) {
+        std::vector<std::vector<cv::Point>> cs;
+        cv::findContours(m.clone(), cs, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+        const auto& c = *std::max_element(cs.begin(), cs.end(), [](auto& a, auto& b) { return a.size() < b.size(); });
+        const int N = (int)c.size(), k = std::max(2, (int)std::lround(4 * u));
+        auto P = [&](int i) { return Vec2(c[((i % N) + N) % N].x, c[((i % N) + N) % N].y); };
+        int hit = 0;
+        std::vector<double> con;
+        for (int i = 0; i < N; i += std::max(1, (int)(2 * u))) {
+            Vec2 t = P(i + k) - P(i - k), p = P(i), nrm(-t.y(), t.x());
+            if (p.x() < 2 || p.y() < 2 || p.x() > m.cols - 3 || p.y() > m.rows - 3) continue;  // frame border
+            nrm /= nrm.norm() + 1e-12;
+            Vec2 x = p + 3 * u * nrm;
+            int xi = std::clamp((int)x.x(), 0, m.cols - 1), yi = std::clamp((int)x.y(), 0, m.rows - 1);
+            if (!m.at<uchar>(yi, xi)) nrm = -nrm;
+            hit += on_edge(p, nrm) && !ink_out(p, nrm);
+            con.push_back(contrast(p, nrm));
+        }
+        return con.size() > 20 && median(con) > 6 ? (double)hit / con.size() : 0.0;
+    };
+    // quadrilateral (cycle order): length on the paper edge minus length off it, so bigger pages
+    // win and overshoot loses; every side must mostly be on the edge
+    auto quad_support = [&](const std::vector<Vec2>& q, double* min_side) {
+        Vec2 ctr = (q[0] + q[1] + q[2] + q[3]) / 4;
+        double tot = 0, mn = 1;
+        for (int k = 0; k < 4; k++) {
+            Vec2 a = q[k], b = q[(k + 1) % 4];
+            double L = (b - a).norm();
+            Vec2 d = (b - a) / L, nrm(-d.y(), d.x());
+            if (nrm.dot(ctr - (a + b) / 2) < 0) nrm = -nrm;
+            int n = std::max(2, (int)(L / (2 * u))), hit = 0, ink = 0, m = 0;
+            std::vector<double> con;
+            for (int s = 0; s < n; s++) {
+                Vec2 p = a + (s + 0.5) / n * (b - a);
+                hit += on_edge(p, nrm);
+                con.push_back(contrast(p, nrm));
+                ink += ink_out(p, nrm);
+                m += 5;
+            }
+            // print right outside means a fold or a printed line, not the page edge
+            double f = median(con) > 6 && ink < 0.02 * m ? (double)hit / n : 0;
+            if (f < 0.6) return *min_side = f, 0.0;  // rejected anyway
+            mn = std::min(mn, f);
+            tot += L * (2 * f - 1);
+        }
+        *min_side = mn;
+        return tot;
+    };
+
+    double best = 0;
+    std::vector<Vec2> bq, fq;  // fq: grey blob, kept if nothing is well supported
+    cv::Mat fm;
+    // region candidates: their mask follows a curved outline
+    for (const cv::Mat& src : {sm, wt}) {
+        cv::Mat t;
+        // close text strokes so the page becomes one blob
+        cv::morphologyEx(src, t, cv::MORPH_CLOSE, cv::Mat::ones(ks(25), ks(25), CV_8U));
+        cv::GaussianBlur(t, t, cv::Size(ks(9), ks(9)), 0);
+        cv::threshold(t, t, 0, 255, cv::THRESH_BINARY + cv::THRESH_OTSU);
+        cv::morphologyEx(t, t, cv::MORPH_OPEN, cv::Mat::ones(ks(15), ks(15), CV_8U));
+        std::vector<Vec2> q;
+        cv::Mat m;
+        if (!blob_quad(t, q, m)) continue;
+        if (fq.empty()) fq = q, fm = m;
+        double f = region_support(m);
+        if (f > 0.85 && best == 0) best = f, bq = q, th = m;  // grey first: unchanged where it worked
+    }
+
+    // straight-edge candidates, only if no region fits (their mask cannot follow a curved outline)
+    if (best == 0) {
+        std::vector<cv::Vec4f> segs;
+        cv::Mat w8;
+        wt.convertTo(w8, CV_8U);
+        cv::createLineSegmentDetector(cv::LSD_REFINE_NONE)->detect(w8, segs);
+        std::vector<Line> lines;
+        std::sort(segs.begin(), segs.end(), [](const cv::Vec4f& a, const cv::Vec4f& b) {
+            return std::hypot(a[2] - a[0], a[3] - a[1]) > std::hypot(b[2] - b[0], b[3] - b[1]);
+        });
+        for (auto& s : segs) {
+            Vec2 a(s[0], s[1]), b(s[2], s[3]);
+            double len = (b - a).norm();
+            if (len < 30 * u) break;
+            Vec2 d = (b - a) / len, n(-d.y(), d.x());
+            double rho = n.dot((a + b) / 2);
+            bool merged = false;
+            for (auto& l : lines) {
+                double c = l.n.dot(n), r = c < 0 ? -rho : rho;
+                if (std::abs(c) > std::cos(3 * M_PI / 180) && std::abs(r - l.rho) < 6 * u) {
+                    l.len += len;
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged && lines.size() < 40) lines.push_back({n, rho, len});
+        }
+        std::sort(lines.begin(), lines.end(), [](const Line& a, const Line& b) { return a.len > b.len; });
+        if (lines.size() > 24) lines.resize(24);
+        // opposite sides: within 30 deg and apart
+        std::vector<std::pair<int, int>> pairs;
+        for (size_t i = 0; i < lines.size(); i++)
+            for (size_t j = i + 1; j < lines.size(); j++) {
+                double c = lines[i].n.dot(lines[j].n);
+                double dr = std::abs((c < 0 ? -lines[j].rho : lines[j].rho) - lines[i].rho);
+                if (std::abs(c) > std::cos(30 * M_PI / 180) && dr > 150 * u) pairs.emplace_back(i, j);
+            }
+        const double W = sm.cols, H = sm.rows, mg = 0.01 * std::max(W, H);
+        for (size_t i = 0; i < pairs.size(); i++)
+            for (size_t j = i + 1; j < pairs.size(); j++) {
+                const Line &a = lines[pairs[i].first], &b = lines[pairs[i].second], &c = lines[pairs[j].first],
+                           &d = lines[pairs[j].second];
+                if (std::abs(a.n.dot(c.n)) > std::cos(50 * M_PI / 180)) continue;
+                std::vector<Vec2> q(4);
+                if (!intersect(a, c, q[0]) || !intersect(c, b, q[1]) || !intersect(b, d, q[2]) ||
+                    !intersect(d, a, q[3]))
+                    continue;
+                bool inside = true;
+                for (auto& v : q) inside &= v.x() > -mg && v.y() > -mg && v.x() < W + mg && v.y() < H + mg;
+                std::vector<cv::Point2f> poly;
+                for (auto& v : q) poly.emplace_back((float)v.x(), (float)v.y());
+                if (!inside || !cv::isContourConvex(poly) || cv::contourArea(poly) < 0.1 * W * H) continue;
+                double mn, sc = quad_support(q, &mn);
+                if (mn >= 0.6 && sc > best) best = sc, bq = q;
+            }
+        // sides may kink at folds: corners from the edges near them, mask along the traced outline
+        if (!bq.empty()) {
+            const int r = std::max(3, (int)std::lround(8 * u));
+            auto o = refine_quad(sm, order_quad(bq), r, 20);
+            bq.assign(o.begin(), o.end());
+            std::vector<cv::Point> pi;
+            for (auto& v : bq) pi.emplace_back((int)std::lround(v.x()), (int)std::lround(v.y()));
+            th = cv::Mat::zeros(sm.size(), CV_8U);
+            cv::fillConvexPoly(th, pi, 255);
+            Pts2 out;
+            std::vector<char> ok;
+            page_outline(sm, th, out, ok, 2 * u, r);
+            pi.clear();
+            for (size_t i = 0; i < out.size(); i++)
+                if (ok[i]) pi.emplace_back((int)std::lround(out[i].x()), (int)std::lround(out[i].y()));
+            if (pi.size() > 50) {
+                th = 0;
+                cv::fillPoly(th, std::vector<std::vector<cv::Point>>{pi}, 255);
+            }
+        }
+    }
+    if (bq.empty()) bq = fq, th = fm;
+    if (bq.empty()) return false;
+    cv::resize(th, mask, g.size(), 0, 0, cv::INTER_NEAREST);
+    std::vector<Vec2> Q;
+    for (auto& v : bq) Q.push_back(v / small_s);
+    quad = order_quad(Q);
     return true;
 }
 
