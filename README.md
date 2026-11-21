@@ -1,9 +1,9 @@
+<img src="docs/icon.svg" width="96" align="right" alt="Unfold app icon">
+
 # Unfold – Document Scanner
 
 An Android scanner app for folded and curved letters: one photo per page → a flat, scanner-like
 page, all pages of a document → one PDF. Everything runs on the phone, offline.
-
-![One photo of a curved page → flat, scanner-like page](docs/example.jpg)
 
 ## Why it is different
 
